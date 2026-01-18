@@ -2,11 +2,28 @@
 
 # Copyright (C) 2006 OpenWrt.org
 # Copyright 2022-2025 sirpdboy <herboy2008@gmail.com>
+# 配额功能扩展 2026-01-18
+
 NAME=timecontrol
 IDLIST="/var/$NAME.idlist"
 TMPID="/var/$NAME.tmpid"
 
-idlist=$(uci show $NAME | grep "enable='1'" | grep "device" | grep -oE '\[.*?\]' | grep -o '[0-9]')
+# 引入配额函数库
+. /usr/share/timecontrol/quota.sh
+
+# 服务停止时持久化配额数据（带锁保护）
+cleanup_and_exit() {
+    quota_lock
+    quota_load
+    quota_persist
+    quota_unlock
+    exit 0
+}
+trap 'cleanup_and_exit' TERM INT
+
+# ============================================================================
+# 辅助函数
+# ============================================================================
 
 config_get_type() {
 	local ret=$(uci -q get "${NAME}.${1}")
@@ -56,6 +73,8 @@ is_weekday_in_range() {
     return 1
 }
 
+# 检查设备是否处于时段阻断期
+# 返回 0=需阻断 1=无需阻断
 check_device() {
     local id=$1
     local start_time=$(config_t_get device timestart $id )
@@ -82,11 +101,128 @@ update_device_status() {
     fi
 }
 
-process_devices() {
-    [ -s $IDLIST ] || touch $IDLIST
+# 确保每个设备有唯一 uid
+ensure_device_uids() {
+    local i=0
+    local changed=0
+    while uci -q get "timecontrol.@device[$i]" >/dev/null; do
+        local uid=$(uci -q get "timecontrol.@device[$i].uid")
+        if [ -z "$uid" ]; then
+            uid="dev_$(head -c 6 /dev/urandom | md5sum | head -c 8)"
+            uci set "timecontrol.@device[$i].uid=$uid"
+            changed=1
+        fi
+        i=$((i + 1))
+    done
+    [ "$changed" = "1" ] && uci commit timecontrol
+}
 
+# ============================================================================
+# 初始化
+# ============================================================================
+
+# 确保状态文件存在
+[ -s $IDLIST ] || touch $IDLIST
+
+# 加载配额状态
+quota_load
+
+# 确保每个设备有 uid
+ensure_device_uids
+
+# 计算下次重置时间
+reset_hour=$(config_t_get timecontrol quota_reset_hour 0 0)
+next_reset=$(quota_get_global "next_reset_epoch")
+now_init=$(date +%s)
+
+# 若 next_reset 为空或时间偏差超过 24 小时，重新计算
+if [ -z "$next_reset" ] || [ "$next_reset" = "0" ]; then
+    next_reset=$(quota_calculate_next_reset "$reset_hour")
+    quota_set_global "next_reset_epoch" "$next_reset"
+else
+    # 检查时间偏差是否超过 24 小时
+    time_diff=$((next_reset - now_init))
+    [ $time_diff -lt 0 ] && time_diff=$((-time_diff))
+    if [ $time_diff -gt 86400 ]; then
+        next_reset=$(quota_calculate_next_reset "$reset_hour")
+        quota_set_global "next_reset_epoch" "$next_reset"
+    fi
+fi
+
+# ============================================================================
+# 主循环
+# ============================================================================
+
+while :; do
+    now=$(date +%s)
+    
+    # 获取锁保护配额读写
+    quota_lock
+    quota_load
+    
+    # 检查配额重置
+    if [ $now -ge $next_reset ]; then
+        quota_reset_all
+        reset_hour=$(config_t_get timecontrol quota_reset_hour 0 0)
+        next_reset=$(quota_calculate_next_reset "$reset_hour")
+        quota_set_global "next_reset_epoch" "$next_reset"
+        quota_persist
+    fi
+    
+    # 重新读取设备列表（热更新），修复多位数索引解析
+    idlist=$(uci show $NAME | grep "enable='1'" | grep "device" | grep -oE '\[([0-9]+)\]' | grep -oE '[0-9]+')
+    valid_uids=""
+    
     for id in $idlist; do
+        uid=$(config_t_get device uid $id)
+        target=$(config_t_get device mac $id)
+        
+        # 收集有效 uid 用于 GC
+        valid_uids="$valid_uids $uid"
+        
+        # 获取配额配置
+        quota_enabled=$(config_t_get device quota_enabled $id 0)
+        quota_minutes=$(config_t_get device quota_minutes $id 0)
+        
+        # 计算 block_period（时段阻断）
         if check_device $id; then
+            block_period=1
+        else
+            block_period=0
+        fi
+        
+        # 计算 is_online
+        if quota_is_online "$target"; then
+            is_online=1
+        else
+            is_online=0
+        fi
+        
+        # 计算 quota_exhausted
+        if [ "$quota_enabled" = "1" ] && quota_is_exhausted "$uid" "$quota_minutes"; then
+            quota_exhausted=1
+        else
+            quota_exhausted=0
+        fi
+        
+        # 计算 blocked_by_quota
+        if [ "$quota_enabled" = "1" ] && [ "$quota_exhausted" = "1" ]; then
+            blocked_by_quota=1
+        else
+            blocked_by_quota=0
+        fi
+        
+        # 最终决策：时段阻断 或 配额阻断
+        should_block=$((block_period || blocked_by_quota))
+        
+        # 是否需要计时
+        should_count=0
+        if [ "$quota_enabled" = "1" ] && [ "$should_block" = "0" ] && [ "$is_online" = "1" ]; then
+            should_count=1
+        fi
+        
+        # 执行阻断/放行
+        if [ "$should_block" = "1" ]; then
             if ! grep -q "!${id}!" $IDLIST; then
                 update_device_status $id "add"
             fi
@@ -95,13 +231,37 @@ process_devices() {
                 update_device_status $id "del"
             fi
         fi
+        
+        # 计时逻辑
+        if [ "$should_count" = "1" ]; then
+            quota_update_usage "$uid" "$now"
+            # 检查是否刚耗尽，需要立即阻断
+            if quota_is_exhausted "$uid" "$quota_minutes"; then
+                update_device_status $id "add"
+                quota_persist
+            fi
+        else
+            quota_mark_offline "$uid"
+        fi
     done
-
+    
+    # GC 清理孤儿配额记录
+    quota_gc "$valid_uids"
+    
+    # 刷新状态到 /tmp
+    quota_flush
+    
+    # 每 10 分钟持久化到 /etc
+    if [ $((now % 600)) -lt 60 ]; then
+        quota_persist
+    fi
+    
+    # 释放锁
+    quota_unlock
+    
+    # 去重状态文件
     cat $IDLIST | sort | uniq > $TMPID
     mv $TMPID $IDLIST
-}
-
-while :; do
-    process_devices
+    
     sleep 60
 done

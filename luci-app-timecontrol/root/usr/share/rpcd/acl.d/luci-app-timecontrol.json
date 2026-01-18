@@ -8,6 +8,12 @@
                         "file": ["exec", "list", "stat", "read"],
                         "uci": [ "*" ],
                         "timecontrol": ["*"]
+            },
+            "file": {
+                "/usr/bin/timecontrol-quota": ["exec"],
+                "/usr/libexec/timecontrol-status": ["exec"],
+                "/tmp/timecontrol_quota.json": ["read"],
+                "/etc/timecontrol_quota.json": ["read"]
             }
 	},
 	"write": {
@@ -15,7 +21,10 @@
                 "timecontrol": ["*"],
                 "file": ["write"],
                 "uci": ["*"]
-      }
+            },
+            "file": {
+                "/etc/timecontrol_quota.json": ["write"]
+            }
     }
   }
 }

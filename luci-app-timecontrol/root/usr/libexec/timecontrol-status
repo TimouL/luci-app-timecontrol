@@ -1,0 +1,5 @@
+#!/bin/sh
+# timecontrol-status - RPC 状态接口
+# 供 LuCI 调用获取配额状态
+
+exec /usr/bin/timecontrol-quota status-json "$@"

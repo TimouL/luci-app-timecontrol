@@ -121,3 +121,36 @@ msgstr "休息日"
 
 msgid "© github "
 msgstr "© 作者 "
+
+msgid "Quota Reset Hour"
+msgstr "配额重置时间"
+
+msgid "Daily quota resets at this hour (0-23). Default is midnight."
+msgstr "每日配额在此时间重置（0-23点）。默认为午夜0点。"
+
+msgid "Next Reset Time"
+msgstr "下次重置时间"
+
+msgid "Quota"
+msgstr "时长限制"
+
+msgid "Daily Quota (min)"
+msgstr "每日配额（分钟）"
+
+msgid "Remaining"
+msgstr "剩余时长"
+
+msgid "Exhausted"
+msgstr "已耗尽"
+
+msgid "Note: Quota is not available for CIDR/range addresses."
+msgstr "注意：CIDR/范围地址不支持配额功能。"
+
+msgid "Block time periods take priority; quota is only consumed when online and not blocked."
+msgstr "禁网时段优先阻断；仅在允许上网且在线时消耗配额。"
+
+msgid "Quota minutes must be greater than 0"
+msgstr "配额分钟数必须大于0"
+
+msgid "Loading..."
+msgstr "加载中..."

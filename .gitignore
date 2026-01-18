@@ -1,0 +1,8 @@
+.ace-tool/
+/bin/
+*.ipk
+*.log
+/tmp/
+*.bak
+*.swp
+*~

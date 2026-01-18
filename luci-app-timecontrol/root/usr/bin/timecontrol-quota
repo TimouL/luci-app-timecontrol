@@ -1,0 +1,450 @@
+#!/bin/sh
+# timecontrol-quota - 配额管理 CLI 工具
+# Copyright 2026
+# 版本: 1.0.0
+
+. /usr/share/timecontrol/quota.sh
+
+NAME="timecontrol"
+
+# UCI 辅助函数
+config_t_get() {
+    local index=${3:-0}
+    local ret=$(uci -q get "${NAME}.@${1}[${index}].${2}")
+    echo "${ret:-${4}}"
+}
+
+# 格式化时间显示
+format_duration() {
+    local minutes=$1
+    local hours=$((minutes / 60))
+    local mins=$((minutes % 60))
+    if [ $hours -gt 0 ]; then
+        echo "${hours}h ${mins}m"
+    else
+        echo "${mins}m"
+    fi
+}
+
+# 获取所有启用配额的设备列表
+# 输出: uid|target|quota_minutes 每行一个
+get_quota_devices() {
+    local idx=0
+    while true; do
+        local uid=$(uci -q get "${NAME}.@device[${idx}].uid")
+        [ -z "$uid" ] && break
+        
+        local enable=$(uci -q get "${NAME}.@device[${idx}].enable")
+        local quota_enabled=$(uci -q get "${NAME}.@device[${idx}].quota_enabled")
+        local quota_minutes=$(uci -q get "${NAME}.@device[${idx}].quota_minutes")
+        local mac=$(uci -q get "${NAME}.@device[${idx}].mac")
+        
+        if [ "$quota_enabled" = "1" ] && [ -n "$quota_minutes" ]; then
+            echo "${uid}|${mac}|${quota_minutes}|${enable}"
+        fi
+        
+        idx=$((idx + 1))
+    done
+}
+
+# 获取单个设备配置
+# 参数: uid
+# 输出: target|quota_minutes|enable
+get_device_config() {
+    local target_uid="$1"
+    local idx=0
+    while true; do
+        local uid=$(uci -q get "${NAME}.@device[${idx}].uid")
+        [ -z "$uid" ] && break
+        
+        if [ "$uid" = "$target_uid" ]; then
+            local mac=$(uci -q get "${NAME}.@device[${idx}].mac")
+            local quota_minutes=$(uci -q get "${NAME}.@device[${idx}].quota_minutes")
+            local enable=$(uci -q get "${NAME}.@device[${idx}].enable")
+            local quota_enabled=$(uci -q get "${NAME}.@device[${idx}].quota_enabled")
+            echo "${mac}|${quota_minutes}|${enable}|${quota_enabled}"
+            return 0
+        fi
+        
+        idx=$((idx + 1))
+    done
+    return 1
+}
+
+# status 命令
+cmd_status() {
+    local filter_uid="$1"
+    
+    quota_lock
+    quota_load
+    
+    printf "%-14s %-22s %-8s %-8s %-10s %s\n" \
+        "UID" "Target" "Used" "Quota" "Remaining" "Status"
+    printf "%s\n" "------------------------------------------------------------------------------"
+    
+    if [ -n "$filter_uid" ] && [ "$filter_uid" != "all" ]; then
+        # 单个设备
+        local config=$(get_device_config "$filter_uid")
+        if [ -z "$config" ]; then
+            echo "Error: Device $filter_uid not found"
+            quota_unlock
+            return 1
+        fi
+        
+        local target=$(echo "$config" | cut -d'|' -f1)
+        local quota_minutes=$(echo "$config" | cut -d'|' -f2)
+        local enable=$(echo "$config" | cut -d'|' -f3)
+        local quota_enabled=$(echo "$config" | cut -d'|' -f4)
+        
+        if [ "$quota_enabled" != "1" ]; then
+            echo "Error: Device $filter_uid does not have quota enabled"
+            quota_unlock
+            return 1
+        fi
+        
+        local used_seconds=$(quota_get "$filter_uid" "used_seconds")
+        used_seconds=${used_seconds:-0}
+        local used_minutes=$((used_seconds / 60))
+        local online=$(quota_get "$filter_uid" "online")
+        
+        local remaining=$((quota_minutes - used_minutes))
+        [ $remaining -lt 0 ] && remaining=0
+        
+        local status="Offline"
+        if [ "$used_seconds" -ge "$((quota_minutes * 60))" ]; then
+            status="Exhausted"
+        elif [ "$online" = "1" ]; then
+            status="Online"
+        fi
+        
+        printf "%-14s %-22s %-8s %-8s %-10s %s\n" \
+            "$filter_uid" "$target" \
+            "$(format_duration $used_minutes)" \
+            "$(format_duration $quota_minutes)" \
+            "$(format_duration $remaining)" \
+            "$status"
+    else
+        # 所有设备
+        get_quota_devices | while IFS='|' read -r uid target quota_minutes enable; do
+            [ -z "$uid" ] && continue
+            
+            local used_seconds=$(quota_get "$uid" "used_seconds")
+            used_seconds=${used_seconds:-0}
+            local used_minutes=$((used_seconds / 60))
+            local online=$(quota_get "$uid" "online")
+            
+            local remaining=$((quota_minutes - used_minutes))
+            [ $remaining -lt 0 ] && remaining=0
+            
+            local status="Offline"
+            if [ "$used_seconds" -ge "$((quota_minutes * 60))" ]; then
+                status="Exhausted"
+            elif [ "$online" = "1" ]; then
+                status="Online"
+            fi
+            
+            printf "%-14s %-22s %-8s %-8s %-10s %s\n" \
+                "$uid" "$target" \
+                "$(format_duration $used_minutes)" \
+                "$(format_duration $quota_minutes)" \
+                "$(format_duration $remaining)" \
+                "$status"
+        done
+    fi
+    
+    quota_unlock
+}
+
+# status-json 命令
+cmd_status_json() {
+    local filter_uid="$1"
+    
+    quota_lock
+    quota_load
+    
+    local next_reset=$(quota_get_global "next_reset_epoch")
+    next_reset=${next_reset:-0}
+    local next_reset_str=""
+    if [ "$next_reset" -gt 0 ]; then
+        next_reset_str=$(date -d "@$next_reset" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+        [ -z "$next_reset_str" ] && next_reset_str=$(date -r "$next_reset" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+    fi
+    
+    # 使用 jshn 构建输出 JSON
+    json_init
+    json_add_string "next_reset" "$next_reset_str"
+    json_add_int "next_reset_epoch" "$next_reset"
+    json_add_object "devices"
+    
+    if [ -n "$filter_uid" ] && [ "$filter_uid" != "all" ]; then
+        # 单个设备
+        local config=$(get_device_config "$filter_uid")
+        if [ -n "$config" ]; then
+            local target=$(echo "$config" | cut -d'|' -f1)
+            local quota_minutes=$(echo "$config" | cut -d'|' -f2)
+            local quota_enabled=$(echo "$config" | cut -d'|' -f4)
+            
+            if [ "$quota_enabled" = "1" ]; then
+                # 重新加载配额状态
+                quota_load
+                local used_seconds=$(quota_get "$filter_uid" "used_seconds")
+                used_seconds=${used_seconds:-0}
+                local used_minutes=$((used_seconds / 60))
+                local online=$(quota_get "$filter_uid" "online")
+                online=${online:-0}
+                
+                local remaining_minutes=$((quota_minutes - used_minutes))
+                [ $remaining_minutes -lt 0 ] && remaining_minutes=0
+                local remaining_fmt=$(format_duration $remaining_minutes)
+                
+                local exhausted=0
+                [ "$used_seconds" -ge "$((quota_minutes * 60))" ] && exhausted=1
+                
+                json_add_object "$filter_uid"
+                json_add_string "target" "$target"
+                json_add_int "used_minutes" "$used_minutes"
+                json_add_int "quota_minutes" "$quota_minutes"
+                json_add_int "remaining_minutes" "$remaining_minutes"
+                json_add_string "remaining_formatted" "$remaining_fmt"
+                json_add_boolean "online" "$online"
+                json_add_boolean "exhausted" "$exhausted"
+                json_close_object
+            fi
+        fi
+    else
+        # 所有设备 - 避免使用管道导致子 shell 问题
+        local devices_data=$(get_quota_devices)
+        local IFS_OLD="$IFS"
+        IFS="
+"
+        for line in $devices_data; do
+            [ -z "$line" ] && continue
+            
+            # 手动解析字段
+            local uid=$(echo "$line" | cut -d'|' -f1)
+            local target=$(echo "$line" | cut -d'|' -f2)
+            local quota_minutes=$(echo "$line" | cut -d'|' -f3)
+            local enable=$(echo "$line" | cut -d'|' -f4)
+            
+            [ -z "$uid" ] && continue
+            
+            local used_seconds=$(quota_get "$uid" "used_seconds")
+            used_seconds=${used_seconds:-0}
+            local used_minutes=$((used_seconds / 60))
+            local online=$(quota_get "$uid" "online")
+            online=${online:-0}
+            
+            local remaining_minutes=$((quota_minutes - used_minutes))
+            [ $remaining_minutes -lt 0 ] && remaining_minutes=0
+            local remaining_fmt=$(format_duration $remaining_minutes)
+            
+            local exhausted=0
+            [ "$used_seconds" -ge "$((quota_minutes * 60))" ] && exhausted=1
+            
+            json_add_object "$uid"
+            json_add_string "target" "$target"
+            json_add_int "used_minutes" "$used_minutes"
+            json_add_int "quota_minutes" "$quota_minutes"
+            json_add_int "remaining_minutes" "$remaining_minutes"
+            json_add_string "remaining_formatted" "$remaining_fmt"
+            json_add_boolean "online" "$online"
+            json_add_boolean "exhausted" "$exhausted"
+            json_close_object
+        done
+        IFS="$IFS_OLD"
+    fi
+    
+    json_close_object
+    json_dump
+    
+    quota_unlock
+}
+
+# 重置单个设备配额
+# 参数: uid
+reset_device() {
+    local uid="$1"
+    local now=$(date +%s)
+    
+    quota_set "$uid" "used_seconds" 0
+    quota_set "$uid" "last_check" "$now"
+    quota_set "$uid" "online" 0
+}
+
+# reset 命令
+cmd_reset() {
+    local filter_uid="$1"
+    
+    if [ -z "$filter_uid" ]; then
+        echo "Usage: timecontrol-quota reset [uid|all]"
+        return 1
+    fi
+    
+    quota_lock
+    quota_load
+    
+    if [ "$filter_uid" = "all" ]; then
+        # 重置所有设备
+        quota_reset_all
+        echo "All device quotas have been reset"
+    else
+        # 重置单个设备
+        local config=$(get_device_config "$filter_uid")
+        if [ -z "$config" ]; then
+            echo "Error: Device $filter_uid not found"
+            quota_unlock
+            return 1
+        fi
+        
+        reset_device "$filter_uid"
+        echo "Quota for $filter_uid has been reset"
+    fi
+    
+    quota_persist
+    quota_flush
+    quota_unlock
+}
+
+# add 命令
+cmd_add() {
+    local uid="$1"
+    local add_minutes="$2"
+    
+    if [ -z "$uid" ] || [ -z "$add_minutes" ]; then
+        echo "Usage: timecontrol-quota add <uid> <minutes>"
+        return 1
+    fi
+    
+    # 验证 add_minutes 是数字
+    if ! echo "$add_minutes" | grep -qE '^[0-9]+$'; then
+        echo "Error: minutes must be a positive integer"
+        return 1
+    fi
+    
+    quota_lock
+    quota_load
+    
+    # 获取设备配置
+    local config=$(get_device_config "$uid")
+    if [ -z "$config" ]; then
+        echo "Error: Device $uid not found"
+        quota_unlock
+        return 1
+    fi
+    
+    local quota_minutes=$(echo "$config" | cut -d'|' -f2)
+    local quota_enabled=$(echo "$config" | cut -d'|' -f4)
+    
+    if [ "$quota_enabled" != "1" ]; then
+        echo "Error: Device $uid does not have quota enabled"
+        quota_unlock
+        return 1
+    fi
+    
+    # 获取当前已使用时间并减少
+    local used_seconds=$(quota_get "$uid" "used_seconds")
+    used_seconds=${used_seconds:-0}
+    local add_seconds=$((add_minutes * 60))
+    local new_used=$((used_seconds - add_seconds))
+    [ $new_used -lt 0 ] && new_used=0
+    
+    quota_set "$uid" "used_seconds" "$new_used"
+    
+    # 计算新的剩余时间
+    local remaining_seconds=$((quota_minutes * 60 - new_used))
+    [ $remaining_seconds -lt 0 ] && remaining_seconds=0
+    local remaining_minutes=$((remaining_seconds / 60))
+    
+    quota_persist
+    quota_flush
+    quota_unlock
+    
+    echo "Added ${add_minutes} minutes to ${uid}. New remaining: $(format_duration $remaining_minutes)"
+}
+
+# info 命令
+cmd_info() {
+    quota_lock
+    quota_load
+    
+    local next_reset=$(quota_get_global "next_reset_epoch")
+    next_reset=${next_reset:-0}
+    local next_reset_str=""
+    local time_until=""
+    
+    if [ "$next_reset" -gt 0 ]; then
+        next_reset_str=$(date -d "@$next_reset" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+        [ -z "$next_reset_str" ] && next_reset_str=$(date -r "$next_reset" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+        
+        local now=$(date +%s)
+        local diff=$((next_reset - now))
+        if [ $diff -gt 0 ]; then
+            local hours=$((diff / 3600))
+            local mins=$(((diff % 3600) / 60))
+            time_until="(in ${hours}h ${mins}m)"
+        else
+            time_until="(past due)"
+        fi
+    else
+        next_reset_str="Not set"
+        time_until=""
+    fi
+    
+    # 统计设备
+    local total=0
+    local exhausted=0
+    
+    get_quota_devices | while IFS='|' read -r uid target quota_minutes enable; do
+        [ -z "$uid" ] && continue
+        total=$((total + 1))
+        
+        local used_seconds=$(quota_get "$uid" "used_seconds")
+        used_seconds=${used_seconds:-0}
+        if [ "$used_seconds" -ge "$((quota_minutes * 60))" ]; then
+            exhausted=$((exhausted + 1))
+        fi
+        
+        # 在子 shell 中输出临时结果
+        echo "$total|$exhausted"
+    done > /tmp/.quota_info_tmp 2>/dev/null
+    
+    # 读取统计结果
+    if [ -f /tmp/.quota_info_tmp ]; then
+        local stats=$(tail -1 /tmp/.quota_info_tmp 2>/dev/null)
+        total=$(echo "$stats" | cut -d'|' -f1)
+        exhausted=$(echo "$stats" | cut -d'|' -f2)
+        rm -f /tmp/.quota_info_tmp
+    fi
+    total=${total:-0}
+    exhausted=${exhausted:-0}
+    
+    echo "Next reset: $next_reset_str $time_until"
+    echo "Total devices with quota: $total"
+    echo "Devices exhausted: $exhausted"
+    
+    quota_unlock
+}
+
+# help 命令
+cmd_help() {
+    echo "Usage: timecontrol-quota <command> [args]"
+    echo ""
+    echo "Commands:"
+    echo "  status [uid|all]     Show quota status"
+    echo "  status-json [uid]    JSON output for RPC"
+    echo "  reset [uid|all]      Reset quota"
+    echo "  add <uid> <minutes>  Add quota minutes"
+    echo "  info                 Show global info"
+    echo "  help                 Show this help"
+}
+
+# 主入口
+case "$1" in
+    status)      cmd_status "$2" ;;
+    status-json) cmd_status_json "$2" ;;
+    reset)       cmd_reset "$2" ;;
+    add)         cmd_add "$2" "$3" ;;
+    info)        cmd_info ;;
+    help|"")     cmd_help ;;
+    *)           echo "Unknown command: $1"; cmd_help; exit 1 ;;
+esac
