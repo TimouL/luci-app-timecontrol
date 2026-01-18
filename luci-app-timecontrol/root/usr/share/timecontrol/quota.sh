@@ -1,7 +1,8 @@
 #!/bin/sh
 # luci-app-timecontrol 配额核心函数库
-# 版本: 1.0.0
+# 版本: 1.1.0
 # 日期: 2026-01-18
+# 修复: Oracle 审查 P0 问题
 
 # ============================================================================
 # 常量定义
@@ -16,13 +17,69 @@ QUOTA_LAST_HASH=""
 . /usr/share/libubox/jshn.sh
 
 # ============================================================================
+# 数字清洗工具函数
+# ============================================================================
+
+# 将输入规范化为整数，非数字返回默认值
+# 参数: 输入值 [默认值=0]
+# 输出: 纯整数
+_to_int() {
+    local val="$1"
+    local default="${2:-0}"
+    
+    # 去除前后空格
+    val=$(echo "$val" | tr -d ' \t\n\r')
+    
+    # 空值返回默认
+    [ -z "$val" ] && { echo "$default"; return; }
+    
+    # 去除前导零（避免八进制问题）
+    # 保留负号，去除数字部分的前导零
+    case "$val" in
+        -*)
+            local sign="-"
+            local num="${val#-}"
+            # 去除前导零
+            while [ "${num#0}" != "$num" ] && [ "${#num}" -gt 1 ]; do
+                num="${num#0}"
+            done
+            # 检查是否为纯数字
+            case "$num" in
+                ''|*[!0-9]*) echo "$default"; return ;;
+            esac
+            echo "${sign}${num}"
+            ;;
+        *)
+            # 去除前导零
+            while [ "${val#0}" != "$val" ] && [ "${#val}" -gt 1 ]; do
+                val="${val#0}"
+            done
+            # 检查是否为纯数字
+            case "$val" in
+                ''|*[!0-9]*) echo "$default"; return ;;
+            esac
+            echo "$val"
+            ;;
+    esac
+}
+
+# ============================================================================
 # 文件锁（flock）
 # ============================================================================
 
 # 获取排它锁
-# 使用 fd 200 作为锁文件描述符
 quota_lock() {
-    # 确保锁目录存在
+    # 检查 flock 是否可用
+    if ! command -v flock >/dev/null 2>&1; then
+        # flock 不可用，使用简单文件锁
+        local lockdir="$(dirname "$QUOTA_LOCK_FILE")"
+        mkdir -p "$lockdir" 2>/dev/null
+        while ! mkdir "$QUOTA_LOCK_FILE.dir" 2>/dev/null; do
+            sleep 1
+        done
+        return 0
+    fi
+    
     mkdir -p "$(dirname "$QUOTA_LOCK_FILE")" 2>/dev/null
     exec 200>"$QUOTA_LOCK_FILE"
     flock -x 200
@@ -30,22 +87,25 @@ quota_lock() {
 
 # 释放锁
 quota_unlock() {
+    if ! command -v flock >/dev/null 2>&1; then
+        rmdir "$QUOTA_LOCK_FILE.dir" 2>/dev/null
+        return 0
+    fi
+    
     flock -u 200
+    exec 200>&-
 }
 
 # ============================================================================
 # 脏标记管理
 # ============================================================================
 
-# 标记状态已变更
 quota_mark_dirty() {
     QUOTA_DIRTY=1
 }
 
-# 检查是否需要写入
-# 返回 0 表示需要写入
 quota_should_write() {
-    [ "$QUOTA_DIRTY" -eq 1 ] && return 0
+    [ "${QUOTA_DIRTY:-0}" = "1" ] && return 0
     return 1
 }
 
@@ -53,57 +113,76 @@ quota_should_write() {
 # JSON 读写
 # ============================================================================
 
-# 从文件加载配额状态到内存（jshn）
-# 优先从 /tmp 读取，fallback 到 /etc
-quota_load() {
-    local content=""
-    
-    if [ -f "$QUOTA_TMP_FILE" ]; then
-        content=$(cat "$QUOTA_TMP_FILE" 2>/dev/null)
-    elif [ -f "$QUOTA_PERSIST_FILE" ]; then
-        content=$(cat "$QUOTA_PERSIST_FILE" 2>/dev/null)
-    fi
-    
-    # 文件不存在或为空时，初始化空结构
-    if [ -z "$content" ]; then
-        json_init
-        json_add_int "version" 1
-        json_add_int "next_reset_epoch" 0
-        json_add_object "devices"
-        json_close_object
-        return 0
-    fi
-    
-    # 加载 JSON 内容
+# 初始化空的配额结构
+_quota_init_empty() {
     json_init
-    if ! json_load "$content" 2>/dev/null; then
-        # 加载失败，初始化空结构
-        json_init
-        json_add_int "version" 1
-        json_add_int "next_reset_epoch" 0
-        json_add_object "devices"
-        json_close_object
-    fi
+    json_add_int "version" 1
+    json_add_int "next_reset_epoch" 0
+    json_add_object "devices"
+    json_close_object
+    quota_mark_dirty
+    QUOTA_LAST_HASH=""
 }
 
-# 将内存状态序列化为 JSON 字符串
+# 从文件加载配额状态到内存
+# 优先从 /tmp 读取，/tmp 损坏时 fallback 到 /etc
+quota_load() {
+    local content=""
+    local loaded=0
+    
+    # 尝试 /tmp
+    if [ -f "$QUOTA_TMP_FILE" ]; then
+        content=$(cat "$QUOTA_TMP_FILE" 2>/dev/null)
+        if [ -n "$content" ]; then
+            json_init
+            if json_load "$content" 2>/dev/null; then
+                loaded=1
+            fi
+        fi
+    fi
+    
+    # /tmp 失败，尝试 /etc
+    if [ "$loaded" != "1" ] && [ -f "$QUOTA_PERSIST_FILE" ]; then
+        content=$(cat "$QUOTA_PERSIST_FILE" 2>/dev/null)
+        if [ -n "$content" ]; then
+            json_init
+            if json_load "$content" 2>/dev/null; then
+                loaded=1
+                # 从持久化恢复成功，标记脏以便写回 /tmp
+                quota_mark_dirty
+            fi
+        fi
+    fi
+    
+    # 都失败，初始化空结构
+    if [ "$loaded" != "1" ]; then
+        _quota_init_empty
+    fi
+    
+    # 更新哈希（避免误判变更）
+    QUOTA_LAST_HASH=$(json_dump 2>/dev/null | md5sum 2>/dev/null | cut -d' ' -f1)
+}
+
 quota_serialize() {
-    json_dump
+    json_dump 2>/dev/null
 }
 
 # 获取设备字段值
 # 参数: uid 字段名
+# 返回: 字段值（失败时返回空字符串）
 quota_get() {
     local uid="$1"
     local field="$2"
     local value=""
     
-    json_select "devices" 2>/dev/null || return 1
-    if json_select "$uid" 2>/dev/null; then
-        json_get_var value "$field"
+    {
+        json_select "devices" || { echo ""; return 1; }
+        if json_select "$uid"; then
+            json_get_var value "$field"
+            json_select ..
+        fi
         json_select ..
-    fi
-    json_select ..
+    } 2>/dev/null
     
     echo "$value"
 }
@@ -115,71 +194,69 @@ quota_set() {
     local field="$2"
     local val="$3"
     
-    # 进入 devices 对象
-    json_select "devices" 2>/dev/null
-    if [ $? -ne 0 ]; then
-        # devices 不存在，需要重建
-        local old_content
-        old_content=$(json_dump)
-        json_init
-        json_load "$old_content" 2>/dev/null
-        json_add_object "devices"
-        json_close_object
-        json_select "devices"
-    fi
-    
-    # 检查设备是否存在
-    if ! json_select "$uid" 2>/dev/null; then
-        # 设备不存在，创建新设备对象
-        json_add_object "$uid"
-        json_add_string "target" ""
-        json_add_int "used_seconds" 0
-        json_add_int "last_check" 0
-        json_add_int "online" 0
-        json_close_object
-        json_select "$uid"
-    fi
-    
-    # 设置字段值
-    # 根据字段类型添加
-    case "$field" in
-        used_seconds|last_check|online)
-            json_add_int "$field" "$val"
-            ;;
-        *)
-            json_add_string "$field" "$val"
-            ;;
-    esac
-    
-    json_select ..
-    json_select ..
+    {
+        # 进入 devices 对象
+        if ! json_select "devices"; then
+            # devices 不存在，在 root 创建
+            json_add_object "devices"
+            json_close_object
+            json_select "devices" || return 1
+        fi
+        
+        # 检查设备是否存在
+        if ! json_select "$uid"; then
+            # 设备不存在，创建新设备对象
+            json_add_object "$uid"
+            json_add_string "target" ""
+            json_add_int "used_seconds" 0
+            json_add_int "last_check" 0
+            json_add_int "online" 0
+            json_close_object
+            json_select "$uid" || { json_select ..; return 1; }
+        fi
+        
+        # 设置字段值（数字类型做清洗）
+        case "$field" in
+            used_seconds|last_check|online)
+                val=$(_to_int "$val" 0)
+                json_add_int "$field" "$val"
+                ;;
+            *)
+                json_add_string "$field" "$val"
+                ;;
+        esac
+        
+        json_select ..
+        json_select ..
+    } 2>/dev/null
     
     quota_mark_dirty
 }
 
 # 获取全局字段值
-# 参数: 字段名（如 next_reset_epoch）
 quota_get_global() {
     local field="$1"
     local value=""
-    json_get_var value "$field"
+    json_get_var value "$field" 2>/dev/null
     echo "$value"
 }
 
 # 设置全局字段值
-# 参数: 字段名 值
 quota_set_global() {
     local field="$1"
     local val="$2"
     
-    case "$field" in
-        version|next_reset_epoch)
-            json_add_int "$field" "$val"
-            ;;
-        *)
-            json_add_string "$field" "$val"
-            ;;
-    esac
+    {
+        case "$field" in
+            version|next_reset_epoch)
+                val=$(_to_int "$val" 0)
+                json_add_int "$field" "$val"
+                ;;
+            *)
+                json_add_string "$field" "$val"
+                ;;
+        esac
+    } 2>/dev/null
     
     quota_mark_dirty
 }
@@ -188,9 +265,6 @@ quota_set_global() {
 # 原子写入
 # ============================================================================
 
-# 原子写入内容到目标文件
-# 使用同目录 mktemp + mv 确保原子性
-# 参数: 内容 目标文件路径
 quota_write() {
     local content="$1"
     local target="$2"
@@ -201,10 +275,11 @@ quota_write() {
     mkdir -p "$dir" 2>/dev/null
     
     tmp="$(mktemp "$dir/.quota.XXXXXX")" || return 1
-    echo "$content" > "$tmp" || {
+    printf '%s\n' "$content" > "$tmp" || {
         rm -f "$tmp"
         return 1
     }
+    chmod 0644 "$tmp" 2>/dev/null
     mv "$tmp" "$target" || {
         rm -f "$tmp"
         return 1
@@ -212,35 +287,31 @@ quota_write() {
     return 0
 }
 
-# 仅在状态变更时写入（带脏标记和哈希比对）
-# 参数: 目标文件路径
 quota_write_if_changed() {
     local target="$1"
     local content
     local new_hash
     
-    # 未变更则跳过
     quota_should_write || return 0
     
     content=$(quota_serialize)
     
-    # 内容哈希比对（双重保险）
-    new_hash=$(echo "$content" | md5sum | cut -d' ' -f1)
-    [ "$new_hash" = "$QUOTA_LAST_HASH" ] && return 0
+    # 哈希比对（使用 printf 避免 echo 问题）
+    if command -v md5sum >/dev/null 2>&1; then
+        new_hash=$(printf '%s' "$content" | md5sum | cut -d' ' -f1)
+        [ "$new_hash" = "$QUOTA_LAST_HASH" ] && return 0
+    fi
     
-    # 执行写入
     quota_write "$content" "$target" || return 1
     QUOTA_LAST_HASH="$new_hash"
     QUOTA_DIRTY=0
     return 0
 }
 
-# 持久化写入到 /etc（低频调用）
 quota_persist() {
     quota_write_if_changed "$QUOTA_PERSIST_FILE"
 }
 
-# 刷新写入到 /tmp（每轮调用）
 quota_flush() {
     quota_write_if_changed "$QUOTA_TMP_FILE"
 }
@@ -250,24 +321,21 @@ quota_flush() {
 # ============================================================================
 
 # 检查设备配额是否耗尽
-# 参数: uid
-# 返回: 0=已耗尽 1=未耗尽
 quota_is_exhausted() {
     local uid="$1"
     local quota_minutes="$2"
     local used_seconds
     local quota_seconds
     
-    used_seconds=$(quota_get "$uid" "used_seconds")
-    used_seconds=${used_seconds:-0}
+    quota_minutes=$(_to_int "$quota_minutes" 0)
+    used_seconds=$(_to_int "$(quota_get "$uid" "used_seconds")" 0)
     quota_seconds=$((quota_minutes * 60))
     
     [ "$used_seconds" -ge "$quota_seconds" ] && return 0
     return 1
 }
 
-# 更新设备使用量（含 offline→online 处理）
-# 参数: uid 当前 epoch
+# 更新设备使用量
 quota_update_usage() {
     local uid="$1"
     local now="$2"
@@ -276,10 +344,9 @@ quota_update_usage() {
     local delta
     local used
     
-    was_online=$(quota_get "$uid" "online")
-    last_check=$(quota_get "$uid" "last_check")
-    was_online=${was_online:-0}
-    last_check=${last_check:-0}
+    now=$(_to_int "$now" 0)
+    was_online=$(_to_int "$(quota_get "$uid" "online")" 0)
+    last_check=$(_to_int "$(quota_get "$uid" "last_check")" 0)
     
     # 刚从 offline 转 online，重置计时起点
     if [ "$was_online" != "1" ]; then
@@ -290,24 +357,22 @@ quota_update_usage() {
     
     # 持续 online，累加时间（上限 120 秒防跳变）
     delta=$((now - last_check))
-    [ $delta -gt 120 ] && delta=120
-    [ $delta -lt 0 ] && delta=0
+    [ "$delta" -gt 120 ] && delta=120
+    [ "$delta" -lt 0 ] && delta=0
     
-    if [ $delta -gt 0 ]; then
-        used=$(quota_get "$uid" "used_seconds")
-        used=${used:-0}
+    if [ "$delta" -gt 0 ]; then
+        used=$(_to_int "$(quota_get "$uid" "used_seconds")" 0)
         quota_set "$uid" "used_seconds" "$((used + delta))"
         quota_set "$uid" "last_check" "$now"
     fi
 }
 
 # 标记设备离线
-# 参数: uid
 quota_mark_offline() {
     local uid="$1"
     local was_online
     
-    was_online=$(quota_get "$uid" "online")
+    was_online=$(_to_int "$(quota_get "$uid" "online")" 0)
     if [ "$was_online" = "1" ]; then
         quota_set "$uid" "online" 0
     fi
@@ -320,26 +385,27 @@ quota_reset_all() {
     local uid
     
     now=$(date +%s)
+    now=$(_to_int "$now" 0)
     
-    # 获取所有设备 uid
-    json_select "devices" 2>/dev/null || return 0
-    json_get_keys uids
-    
-    for uid in $uids; do
-        json_select "$uid" 2>/dev/null || continue
-        json_add_int "used_seconds" 0
-        json_add_int "last_check" "$now"
-        json_add_int "online" 0
+    {
+        json_select "devices" || return 0
+        json_get_keys uids
+        
+        for uid in $uids; do
+            json_select "$uid" || continue
+            json_add_int "used_seconds" 0
+            json_add_int "last_check" "$now"
+            json_add_int "online" 0
+            json_select ..
+        done
+        
         json_select ..
-    done
+    } 2>/dev/null
     
-    json_select ..
     quota_mark_dirty
 }
 
 # 计算下次配额重置的 epoch 时间
-# 参数: 重置小时（0-23）
-# 输出: 下次重置的 epoch
 quota_calculate_next_reset() {
     local reset_hour="$1"
     local now
@@ -347,24 +413,34 @@ quota_calculate_next_reset() {
     local reset_today
     local tomorrow_reset
     
+    reset_hour=$(_to_int "$reset_hour" 0)
+    # 限制范围 0-23
+    [ "$reset_hour" -lt 0 ] && reset_hour=0
+    [ "$reset_hour" -gt 23 ] && reset_hour=0
+    
     now=$(date +%s)
+    now=$(_to_int "$now" 0)
     
     # 获取今天 0 点的 epoch
     today_start=$(date -d "$(date +%Y-%m-%d)" +%s 2>/dev/null)
     
     # 如果 busybox date 不支持 -d，使用替代方案
-    if [ -z "$today_start" ]; then
+    if [ -z "$today_start" ] || [ "$today_start" = "" ]; then
         local hour min sec
         hour=$(date +%H)
         min=$(date +%M)
         sec=$(date +%S)
+        # 使用 10# 避免八进制问题
+        hour=$((10#$hour + 0))
+        min=$((10#$min + 0))
+        sec=$((10#$sec + 0))
         today_start=$((now - hour*3600 - min*60 - sec))
     fi
     
-    # 今天的重置时刻
+    today_start=$(_to_int "$today_start" "$now")
+    
     reset_today=$((today_start + reset_hour * 3600))
     
-    # 如果今天重置时刻已过，返回明天的重置时刻
     if [ "$now" -ge "$reset_today" ]; then
         tomorrow_reset=$((reset_today + 86400))
         echo "$tomorrow_reset"
@@ -377,26 +453,25 @@ quota_calculate_next_reset() {
 # 在线判定
 # ============================================================================
 
-# 判断目标是否在线
-# 参数: target（IP 或 MAC）
-# 返回: 0=在线 1=离线
 quota_is_online() {
     local target="$1"
     local state
     local ip
     
-    # 优先判断 MAC 格式（6 组 hex，用:分隔）
+    # 检查必要命令
+    command -v ip >/dev/null 2>&1 || return 1
+    
     # MAC 格式: XX:XX:XX:XX:XX:XX
     if echo "$target" | grep -qE '^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'; then
-        # MAC 地址：从 /proc/net/arp 反查 IP
-        ip=$(grep -i "$target" /proc/net/arp 2>/dev/null | awk '{print $1}' | head -1)
+        # MAC 地址：从 /proc/net/arp 反查 IP（使用 -F 固定字符串匹配）
+        ip=$(grep -iF "$target" /proc/net/arp 2>/dev/null | awk '{print $1}' | head -1)
         if [ -n "$ip" ]; then
             quota_is_online "$ip" && return 0
         fi
         return 1
     fi
     
-    # IPv4 格式: x.x.x.x
+    # IPv4 格式
     if echo "$target" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
         state=$(ip neigh show "$target" 2>/dev/null | awk '{print $NF}')
         case "$state" in
@@ -407,8 +482,6 @@ quota_is_online() {
         return 1
     fi
     
-    # IPv6 格式（暂不支持，返回离线）
-    # v1.0 仅支持 IPv4 + MAC
     return 1
 }
 
@@ -416,48 +489,28 @@ quota_is_online() {
 # 格式校验
 # ============================================================================
 
-# 检查目标是否为单 IP/MAC（非 range/CIDR）
-# 参数: target
-# 返回: 0=单目标（支持配额） 1=range/CIDR（不支持配额）
 quota_is_single_target() {
     local target="$1"
     
-    # 检查是否包含 CIDR 标记（/）
-    if echo "$target" | grep -q '/'; then
-        return 1
-    fi
-    
-    # 检查是否为 IP range（-）
-    if echo "$target" | grep -q '-'; then
-        return 1
-    fi
-    
-    # 检查是否为多值（逗号或空格分隔）
-    if echo "$target" | grep -qE '[, ]'; then
-        return 1
-    fi
+    # CIDR
+    echo "$target" | grep -q '/' && return 1
+    # IP range
+    echo "$target" | grep -q '-' && return 1
+    # 多值
+    echo "$target" | grep -qE '[, ]' && return 1
     
     # 单 IPv4
-    if echo "$target" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
-        return 0
-    fi
-    
+    echo "$target" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && return 0
     # 单 MAC
-    if echo "$target" | grep -qE '^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$'; then
-        return 0
-    fi
+    echo "$target" | grep -qE '^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$' && return 0
     
-    # 其他格式（如主机名），不支持配额
     return 1
 }
 
 # ============================================================================
-# GC 清理
+# GC 清理（使用 jshn 重建，不依赖 jsonfilter）
 # ============================================================================
 
-# 清理不存在的 uid（孤儿项）
-# 参数: 有效 uid 列表（空格分隔）
-# 通过重建 devices 对象实现删除
 quota_gc() {
     local valid_uids="$1"
     local existing_uids
@@ -466,76 +519,85 @@ quota_gc() {
     local valid
     local has_orphan=0
     
-    # 获取 JSON 中所有设备 uid
-    json_select "devices" 2>/dev/null || return 0
-    json_get_keys existing_uids
+    # 临时存储有效设备数据
+    local dev_data=""
     
-    # 先检查是否有孤儿项
-    for uid in $existing_uids; do
-        found=0
-        for valid in $valid_uids; do
-            if [ "$uid" = "$valid" ]; then
-                found=1
-                break
-            fi
-        done
+    {
+        json_select "devices" || return 0
+        json_get_keys existing_uids
         
-        if [ "$found" -eq 0 ]; then
-            has_orphan=1
-            break
-        fi
-    done
-    
-    json_select ..
-    
-    # 如果有孤儿项，需要重建 devices 对象
-    if [ "$has_orphan" -eq 1 ]; then
-        local old_json=$(quota_serialize)
-        local new_devices=""
-        
-        # 遍历有效 uid，提取其数据
-        for valid in $valid_uids; do
-            [ -z "$valid" ] && continue
+        # 检查是否有孤儿项并收集有效设备数据
+        for uid in $existing_uids; do
+            found=0
+            for valid in $valid_uids; do
+                if [ "$uid" = "$valid" ]; then
+                    found=1
+                    break
+                fi
+            done
             
-            # 使用 jsonfilter 提取设备数据
-            local device_data=$(echo "$old_json" | jsonfilter -e "$.devices['$valid']" 2>/dev/null)
-            if [ -n "$device_data" ]; then
-                if [ -z "$new_devices" ]; then
-                    new_devices="\"$valid\":$device_data"
-                else
-                    new_devices="$new_devices,\"$valid\":$device_data"
+            if [ "$found" = "0" ]; then
+                has_orphan=1
+            else
+                # 收集有效设备数据
+                if json_select "$uid"; then
+                    local target used_seconds last_check online
+                    json_get_var target "target"
+                    json_get_var used_seconds "used_seconds"
+                    json_get_var last_check "last_check"
+                    json_get_var online "online"
+                    dev_data="$dev_data $uid|$target|$used_seconds|$last_check|$online"
+                    json_select ..
                 fi
             fi
         done
         
-        # 重建 JSON
-        local version=$(echo "$old_json" | jsonfilter -e '$.version' 2>/dev/null)
-        local next_reset=$(echo "$old_json" | jsonfilter -e '$.next_reset_epoch' 2>/dev/null)
-        version=${version:-1}
-        next_reset=${next_reset:-0}
+        json_select ..
+    } 2>/dev/null
+    
+    # 如果有孤儿项，重建 devices 对象
+    if [ "$has_orphan" = "1" ]; then
+        local version next_reset
+        version=$(_to_int "$(quota_get_global "version")" 1)
+        next_reset=$(_to_int "$(quota_get_global "next_reset_epoch")" 0)
         
-        local new_json="{\"version\":$version,\"next_reset_epoch\":$next_reset,\"devices\":{$new_devices}}"
-        
-        # 重新加载
+        # 重新初始化
         json_init
-        if json_load "$new_json" 2>/dev/null; then
-            quota_mark_dirty
-        else
-            # 加载失败，保持原状
-            json_init
-            json_load "$old_json" 2>/dev/null
-        fi
+        json_add_int "version" "$version"
+        json_add_int "next_reset_epoch" "$next_reset"
+        json_add_object "devices"
+        
+        # 恢复有效设备
+        for entry in $dev_data; do
+            [ -z "$entry" ] && continue
+            local uid target used_seconds last_check online
+            uid=$(echo "$entry" | cut -d'|' -f1)
+            target=$(echo "$entry" | cut -d'|' -f2)
+            used_seconds=$(_to_int "$(echo "$entry" | cut -d'|' -f3)" 0)
+            last_check=$(_to_int "$(echo "$entry" | cut -d'|' -f4)" 0)
+            online=$(_to_int "$(echo "$entry" | cut -d'|' -f5)" 0)
+            
+            json_add_object "$uid"
+            json_add_string "target" "$target"
+            json_add_int "used_seconds" "$used_seconds"
+            json_add_int "last_check" "$last_check"
+            json_add_int "online" "$online"
+            json_close_object
+        done
+        
+        json_close_object
+        quota_mark_dirty
     fi
 }
 
 # 初始化设备配额记录
-# 参数: uid target
 quota_init_device() {
     local uid="$1"
     local target="$2"
     local now
     
     now=$(date +%s)
+    now=$(_to_int "$now" 0)
     
     quota_set "$uid" "target" "$target"
     quota_set "$uid" "used_seconds" 0
@@ -544,8 +606,6 @@ quota_init_device() {
 }
 
 # 获取设备剩余秒数
-# 参数: uid quota_minutes
-# 输出: 剩余秒数（负数表示已超额）
 quota_get_remaining() {
     local uid="$1"
     local quota_minutes="$2"
@@ -553,8 +613,8 @@ quota_get_remaining() {
     local quota_seconds
     local remaining
     
-    used_seconds=$(quota_get "$uid" "used_seconds")
-    used_seconds=${used_seconds:-0}
+    quota_minutes=$(_to_int "$quota_minutes" 0)
+    used_seconds=$(_to_int "$(quota_get "$uid" "used_seconds")" 0)
     quota_seconds=$((quota_minutes * 60))
     remaining=$((quota_seconds - used_seconds))
     
@@ -562,13 +622,13 @@ quota_get_remaining() {
 }
 
 # 格式化秒数为易读字符串
-# 参数: 秒数
-# 输出: "Xh Ym" 或 "Xm Ys"
 quota_format_time() {
     local seconds="$1"
     local hours
     local mins
     local secs
+    
+    seconds=$(_to_int "$seconds" 0)
     
     if [ "$seconds" -le 0 ]; then
         echo "0m"
