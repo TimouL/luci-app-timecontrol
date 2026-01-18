@@ -124,11 +124,12 @@ ensure_device_uids() {
 # 确保状态文件存在
 [ -s $IDLIST ] || touch $IDLIST
 
-# 加载配额状态
-quota_load
-
 # 确保每个设备有 uid
 ensure_device_uids
+
+# 初始化配额状态（带锁保护，立即持久化）
+quota_lock
+quota_load
 
 # 计算下次重置时间
 reset_hour=$(config_t_get timecontrol quota_reset_hour 0 0)
@@ -149,6 +150,11 @@ else
     fi
 fi
 
+# 初始化阶段立即持久化（修复 next_reset_epoch 不生效问题）
+quota_flush
+quota_persist
+quota_unlock
+
 # ============================================================================
 # 主循环
 # ============================================================================
@@ -159,6 +165,9 @@ while :; do
     # 获取锁保护配额读写
     quota_lock
     quota_load
+    
+    # 刷新 next_reset 变量（确保与 JSON 同步）
+    next_reset=$(_to_int "$(quota_get_global "next_reset_epoch")" 0)
     
     # 检查配额重置
     if [ $now -ge $next_reset ]; then
@@ -183,6 +192,11 @@ while :; do
         # 获取配额配置
         quota_enabled=$(config_t_get device quota_enabled $id 0)
         quota_minutes=$(config_t_get device quota_minutes $id 0)
+        
+        # 确保配额设备记录存在（不重置已有用量）
+        if [ "$quota_enabled" = "1" ]; then
+            quota_ensure_device "$uid" "$target" "$now"
+        fi
         
         # 计算 block_period（时段阻断）
         if check_device $id; then

@@ -605,6 +605,36 @@ quota_init_device() {
     quota_set "$uid" "online" 0
 }
 
+# 确保设备配额记录存在（不重置已有用量）
+# 参数: uid target now
+# 设备不存在时创建，存在时仅更新 target
+quota_ensure_device() {
+    local uid="$1"
+    local target="$2"
+    local now="$3"
+    local existing_target
+    local existing_used
+    
+    now=$(_to_int "$now" 0)
+    
+    # 检查设备是否已存在
+    existing_used=$(quota_get "$uid" "used_seconds")
+    
+    if [ -z "$existing_used" ]; then
+        # 设备不存在，初始化
+        quota_set "$uid" "target" "$target"
+        quota_set "$uid" "used_seconds" 0
+        quota_set "$uid" "last_check" "$now"
+        quota_set "$uid" "online" 0
+    else
+        # 设备存在，仅更新 target（MAC 可能变化）
+        existing_target=$(quota_get "$uid" "target")
+        if [ "$existing_target" != "$target" ]; then
+            quota_set "$uid" "target" "$target"
+        fi
+    fi
+}
+
 # 获取设备剩余秒数
 quota_get_remaining() {
     local uid="$1"
