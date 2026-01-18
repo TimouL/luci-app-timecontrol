@@ -10,10 +10,16 @@
                         "timecontrol": ["*"]
             },
             "file": {
+                "/bin/ps": ["exec"],
+                "/usr/bin/ps": ["exec"],
+                "/usr/bin/timecontrol": ["exec"],
+                "/usr/bin/timecontrolctrl": ["exec"],
                 "/usr/bin/timecontrol-quota": ["exec"],
                 "/usr/libexec/timecontrol-status": ["exec"],
+                "/usr/libexec/timecontrol-call": ["exec"],
                 "/tmp/timecontrol_quota.json": ["read"],
-                "/etc/timecontrol_quota.json": ["read"]
+                "/etc/timecontrol_quota.json": ["read"],
+                "/var/log/timecontrol.log": ["read"]
             }
 	},
 	"write": {
