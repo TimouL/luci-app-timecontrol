@@ -266,7 +266,7 @@ return view.extend({
             ]);
         };
 
-        s = m.section(form.TypedSection, 'timecontrol');
+        s = m.section(form.TypedSection, 'timecontrol', _('Global Settings'));
         s.anonymous = true;
         s.addremove = false;
 
@@ -278,7 +278,7 @@ return view.extend({
         // o.value('whitelist', _('Whitelist'));
         // o.default = 'blacklist';
 
-        o = s.option(cbiRichListValue, 'chain', _('Control Intensity'),
+        o = s.option(form.ListValue, 'chain', _('Control Intensity'),
             _('Pay attention to strong control: machines under control will not be able to connect to the software router backend!'));
         o.value('forward', _('Ordinary forward control'));
         o.value('input', _('Strong input control'));
