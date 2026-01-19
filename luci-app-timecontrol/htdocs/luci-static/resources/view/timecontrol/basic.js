@@ -92,17 +92,17 @@ function updateQuotaStatus() {
                 nextResetEl.textContent = data.next_reset;
             }
             
-            // 更新各设备剩余时长
+            // 更新各设备剩余时长（用分钟显示）
             var devices = data.devices || {};
             document.querySelectorAll('.quota-remaining').forEach(function(el) {
                 var uid = el.dataset.uid;
                 if (uid && devices[uid]) {
                     var d = devices[uid];
-                    var text = d.remaining_formatted || '--';
+                    var text = String(d.remaining_minutes);
                     var color = 'inherit';
                     
                     if (d.exhausted) {
-                        text = _('Exhausted');
+                        text = '0';
                         color = 'red';
                     } else if (d.remaining_minutes <= 5) {
                         color = 'orange';
@@ -164,6 +164,58 @@ return view.extend({
         var m, s, o;
         var hostList = [];
 
+        // 注入列宽样式
+        // 列顺序: 1-Comment, 2-Enabled, 3-IP/MAC, 4-Start, 5-Stop, 6-Week, 7-Enable Quota, 8-Quota, 9-Remaining, 10-Actions
+        var styleId = 'timecontrol-table-style';
+        if (!document.getElementById(styleId)) {
+            var style = document.createElement('style');
+            style.id = styleId;
+            var tableSel = '#cbi-timecontrol-device table.cbi-section-table';
+            style.textContent = [
+                '#cbi-timecontrol-device .table { overflow-x: auto; }',
+                tableSel + ' { table-layout: fixed; width: 100%; }',
+
+                tableSel + ' th { white-space: normal !important; word-wrap: break-word !important; overflow: visible !important; }',
+                tableSel + ' td { overflow: hidden; text-overflow: ellipsis; }',
+
+                tableSel + ' input, ' + tableSel + ' select { min-width: 0; box-sizing: border-box; }',
+                tableSel + ' input[type="text"], ' + tableSel + ' select { width: 100%; }',
+
+                tableSel + ' td:nth-child(4) input, ' + tableSel + ' td:nth-child(5) input { text-align: center; font-variant-numeric: tabular-nums; }',
+
+                '#cbi-timecontrol-device tr.cbi-section-table-titles th:nth-child(1), ' +
+                tableSel + ' tr td:nth-child(1) { width: 18%; }',
+
+                '#cbi-timecontrol-device tr.cbi-section-table-titles th:nth-child(2), ' +
+                tableSel + ' tr td:nth-child(2) { width: 50px; text-align: center; }',
+
+                '#cbi-timecontrol-device tr.cbi-section-table-titles th:nth-child(3), ' +
+                tableSel + ' tr td:nth-child(3) { width: 22%; }',
+
+                '#cbi-timecontrol-device tr.cbi-section-table-titles th:nth-child(4), ' +
+                tableSel + ' tr td:nth-child(4) { width: 80px; }',
+
+                '#cbi-timecontrol-device tr.cbi-section-table-titles th:nth-child(5), ' +
+                tableSel + ' tr td:nth-child(5) { width: 80px; }',
+
+                '#cbi-timecontrol-device tr.cbi-section-table-titles th:nth-child(6), ' +
+                tableSel + ' tr td:nth-child(6) { width: 100px; }',
+
+                '#cbi-timecontrol-device tr.cbi-section-table-titles th:nth-child(7), ' +
+                tableSel + ' tr td:nth-child(7) { width: 70px; text-align: center; }',
+
+                '#cbi-timecontrol-device tr.cbi-section-table-titles th:nth-child(8), ' +
+                tableSel + ' tr td:nth-child(8) { width: 70px; text-align: center; }',
+
+                '#cbi-timecontrol-device tr.cbi-section-table-titles th:nth-child(9), ' +
+                tableSel + ' tr td:nth-child(9) { width: 80px; }',
+
+                '#cbi-timecontrol-device tr.cbi-section-table-titles th:nth-child(10), ' +
+                tableSel + ' tr td:nth-child(10) { width: 100px; }'
+            ].join('\n');
+            document.head.appendChild(style);
+        }
+
         m = new form.Map('timecontrol', _('Internet Time Control'),
             _('Users can limit their internet usage time through MAC and IP, with available IP ranges such as 192.168.110.00 to 192.168.10.200') + '<br/>' +
             _('Suggested feedback:') + ' <a href="https://github.com/sirpdboy/luci-app-timecontrol.git" target="_blank">GitHub @timecontrol</a>');
@@ -218,12 +270,13 @@ return view.extend({
         s.anonymous = true;
         s.addremove = false;
 
-        o = s.option(cbiRichListValue, 'list_type', _('Control Mode'),
-            _('blacklist: Block the networking of the target address, whitelist: Only allow networking for the target address and block all other addresses.'));
-        o.rmempty = false;
-        o.value('blacklist', _('Blacklist'));
+        // 控制模式（仅黑名单模式时隐藏）
+        // o = s.option(cbiRichListValue, 'list_type', _('Control Mode'),
+        //     _('blacklist: Block the networking of the target address, whitelist: Only allow networking for the target address and block all other addresses.'));
+        // o.rmempty = false;
+        // o.value('blacklist', _('Blacklist'));
         // o.value('whitelist', _('Whitelist'));
-        o.default = 'blacklist';
+        // o.default = 'blacklist';
 
         o = s.option(cbiRichListValue, 'chain', _('Control Intensity'),
             _('Pay attention to strong control: machines under control will not be able to connect to the software router backend!'));
@@ -313,7 +366,8 @@ return view.extend({
         o.default = '00:00';
         o.rmempty = false;
 
-        o = s.option(form.ListValue, 'week', _('Week Day (1~7)'));
+        o = s.option(form.ListValue, 'week', _('Week'));
+        o.width = '80px';
         o.value('0', _('Everyday'));
         o.value('1', _('Monday'));
         o.value('2', _('Tuesday'));
@@ -327,26 +381,70 @@ return view.extend({
         o.default = '0';
         o.rmempty = false;
 
+        // 判断是否为单一 IP/MAC（可用配额功能）
+        function isQuotaEligible(section_id) {
+            var mac = uci.get('timecontrol', section_id, 'mac') || '';
+            return !mac.includes('/') && !mac.includes('-') && !mac.includes(',') && !mac.includes(' ');
+        }
+
         // 启用时长限制（在 week 之后）
-        o = s.option(form.Flag, 'quota_enabled', _('Quota'));
+        o = s.option(form.Flag, 'quota_enabled', _('Enable Quota'));
+        o.width = '80px';
         o.rmempty = false;
         o.default = '0';
-        // 对 range/CIDR/多值 灰化（通过 depends 函数判断）
-        o.depends(function(section_id) {
-            var mac = uci.get('timecontrol', section_id, 'mac') || '';
-            // 单 IP/MAC 才显示配额选项（排除 CIDR、range、逗号/空格多值）
-            return !mac.includes('/') && !mac.includes('-') && !mac.includes(',') && !mac.includes(' ');
-        });
+        // 不使用 depends（会导致列错位），改为在 renderWidget 中处理
+        o.renderWidget = function(section_id, option_index, cfgvalue) {
+            if (!isQuotaEligible(section_id)) {
+                return E('em', { 'style': 'color: #999;' }, 'N/A');
+            }
+            return form.Flag.prototype.renderWidget.apply(this, [section_id, option_index, cfgvalue]);
+        };
+        // 不合规时强制写入 0，避免配置残留
+        o.write = function(section_id, formvalue) {
+            if (!isQuotaEligible(section_id)) {
+                uci.set('timecontrol', section_id, 'quota_enabled', '0');
+                return;
+            }
+            return form.Flag.prototype.write.apply(this, [section_id, formvalue]);
+        };
 
-        // 每日配额（分钟）- 设为 modalonly
-        o = s.option(form.Value, 'quota_minutes', _('Daily Quota (min)'));
+        // 每日配额（分钟）
+        o = s.option(form.Value, 'quota_minutes', _('Quota (min)'));
+        o.width = '80px';
         o.datatype = 'uinteger';
         o.placeholder = '120';
         o.default = '120';
-        o.modalonly = true;
-        o.depends('quota_enabled', '1');
+        o.renderWidget = function(section_id, option_index, cfgvalue) {
+            if (!isQuotaEligible(section_id)) {
+                return E('em', { 'style': 'color:#999' }, _('N/A'));
+            }
+
+            var widget = form.Value.prototype.renderWidget.call(this, section_id, option_index, cfgvalue);
+            var naEl = E('em', { 'style': 'color:#999' }, _('N/A'));
+            var widgetWrapper = E('span', {}, [widget]);
+            var container = E('div', {}, [widgetWrapper, naEl]);
+
+            var self = this;
+            
+            function updateVisibility() {
+                var quotaEnabledOpt = self.map.lookupOption('quota_enabled', section_id);
+                var v = null;
+                if (quotaEnabledOpt && quotaEnabledOpt[0]) {
+                    v = quotaEnabledOpt[0].formvalue(section_id);
+                }
+                var enabled = (v === '1' || v === true);
+                widgetWrapper.style.display = enabled ? '' : 'none';
+                naEl.style.display = enabled ? 'none' : '';
+            }
+
+            document.addEventListener('widget-change', updateVisibility);
+            window.requestAnimationFrame(updateVisibility);
+
+            return container;
+        };
         o.validate = function(section_id, value) {
-            if (uci.get('timecontrol', section_id, 'quota_enabled') === '1') {
+            var quotaEnabled = uci.get('timecontrol', section_id, 'quota_enabled');
+            if (quotaEnabled === '1') {
                 if (!value || parseInt(value) <= 0) {
                     return _('Quota minutes must be greater than 0');
                 }
@@ -354,10 +452,14 @@ return view.extend({
             return true;
         };
 
-        // 剩余时长（只读）
-        o = s.option(form.DummyValue, '_remaining', _('Remaining'));
+        // 当天剩余时长（只读，分钟显示）
+        o = s.option(form.DummyValue, '_remaining', _('Remaining Today (min)'));
+        o.width = '100px';
         o.rawhtml = true;
         o.cfgvalue = function(section_id) {
+            if (!isQuotaEligible(section_id)) {
+                return '<em style="color: #999;">N/A</em>';
+            }
             var uid = uci.get('timecontrol', section_id, 'uid');
             return '<span class="quota-remaining" data-uid="' + (uid || '') + '">--</span>';
         };

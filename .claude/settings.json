@@ -1,0 +1,15 @@
+{
+  "debug": {
+    "router": {
+      "address": "192.168.88.1",
+      "username": "root",
+      "password": "root",
+      "luci_url": "http://192.168.88.1/cgi-bin/luci/",
+      "timecontrol_url": "http://192.168.88.1/cgi-bin/luci/admin/services/timecontrol"
+    },
+    "ssh": {
+      "command": "ssh root@192.168.88.1",
+      "deploy_js": "scp luci-app-timecontrol/htdocs/luci-static/resources/view/timecontrol/basic.js root@192.168.88.1:/www/luci-static/resources/view/timecontrol/basic.js"
+    }
+  }
+}

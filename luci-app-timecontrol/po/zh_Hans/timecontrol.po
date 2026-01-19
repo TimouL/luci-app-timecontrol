@@ -87,7 +87,10 @@ msgid "Stop Control Time"
 msgstr "控制结束时间"
 
 msgid "Week Day (1~7)"
-msgstr "星期（1~7）"
+msgstr "星期"
+
+msgid "Week"
+msgstr "星期"
 
 msgid "Everyday"
 msgstr "每天"
@@ -134,11 +137,20 @@ msgstr "下次重置时间"
 msgid "Quota"
 msgstr "时长限制"
 
+msgid "Enable Quota"
+msgstr "启用时长限制"
+
 msgid "Daily Quota (min)"
-msgstr "每日配额（分钟）"
+msgstr "每天可用时长"
+
+msgid "Quota (min)"
+msgstr "配额(分)"
 
 msgid "Remaining"
 msgstr "剩余时长"
+
+msgid "Remaining Today (min)"
+msgstr "当天剩余时长"
 
 msgid "Exhausted"
 msgstr "已耗尽"
@@ -154,3 +166,12 @@ msgstr "配额分钟数必须大于0"
 
 msgid "Loading..."
 msgstr "加载中..."
+
+msgid "IP/MAC Address is required"
+msgstr "IP/MAC地址为必填项"
+
+msgid "Note: Quota is not available for CIDR/range/multi-value addresses."
+msgstr "注意：CIDR/范围/多值地址不支持配额功能。"
+
+msgid "N/A"
+msgstr "不适用"
