@@ -219,12 +219,14 @@ load_quota_lib() {
 # ============================================================================
 
 test_dirty_flag() {
-    QUOTA_DIRTY=0
+    QUOTA_DIRTY_TMP=0
+    QUOTA_DIRTY_PERSIST=0
     
-    quota_should_write && { fail "Should be clean initially"; return; }
+    quota_should_write_tmp && { fail "Should be clean initially"; return; }
     
     quota_mark_dirty
-    quota_should_write || { fail "Should be dirty after mark"; return; }
+    quota_should_write_tmp || { fail "Should be dirty after mark (tmp)"; return; }
+    quota_should_write_persist || { fail "Should be dirty after mark (persist)"; return; }
     
     pass "Dirty flag works"
 }

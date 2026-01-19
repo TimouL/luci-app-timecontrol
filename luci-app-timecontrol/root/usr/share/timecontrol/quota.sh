@@ -10,8 +10,11 @@
 QUOTA_TMP_FILE="/tmp/timecontrol_quota.json"
 QUOTA_PERSIST_FILE="/etc/timecontrol_quota.json"
 QUOTA_LOCK_FILE="/var/lock/timecontrol_quota.lock"
-QUOTA_DIRTY=0
-QUOTA_LAST_HASH=""
+# 分离 /tmp 和 /etc 的脏标记和哈希，避免互相干扰
+QUOTA_DIRTY_TMP=0
+QUOTA_DIRTY_PERSIST=0
+QUOTA_LAST_HASH_TMP=""
+QUOTA_LAST_HASH_PERSIST=""
 
 # 加载 OpenWrt JSON 库
 . /usr/share/libubox/jshn.sh
@@ -101,11 +104,17 @@ quota_unlock() {
 # ============================================================================
 
 quota_mark_dirty() {
-    QUOTA_DIRTY=1
+    QUOTA_DIRTY_TMP=1
+    QUOTA_DIRTY_PERSIST=1
 }
 
-quota_should_write() {
-    [ "${QUOTA_DIRTY:-0}" = "1" ] && return 0
+quota_should_write_tmp() {
+    [ "${QUOTA_DIRTY_TMP:-0}" = "1" ] && return 0
+    return 1
+}
+
+quota_should_write_persist() {
+    [ "${QUOTA_DIRTY_PERSIST:-0}" = "1" ] && return 0
     return 1
 }
 
@@ -121,7 +130,8 @@ _quota_init_empty() {
     json_add_object "devices"
     json_close_object
     quota_mark_dirty
-    QUOTA_LAST_HASH=""
+    QUOTA_LAST_HASH_TMP=""
+    QUOTA_LAST_HASH_PERSIST=""
 }
 
 # 从文件加载配额状态到内存
@@ -157,10 +167,16 @@ quota_load() {
     # 都失败，初始化空结构
     if [ "$loaded" != "1" ]; then
         _quota_init_empty
+        return 0
     fi
     
-    # 更新哈希（避免误判变更）
-    QUOTA_LAST_HASH=$(json_dump 2>/dev/null | md5sum 2>/dev/null | cut -d' ' -f1)
+    # 加载成功后，更新两边的哈希基准（避免误判变更）
+    local current_hash
+    if command -v md5sum >/dev/null 2>&1; then
+        current_hash=$(json_dump 2>/dev/null | md5sum | cut -d' ' -f1)
+        QUOTA_LAST_HASH_TMP="$current_hash"
+        QUOTA_LAST_HASH_PERSIST="$current_hash"
+    fi
 }
 
 quota_serialize() {
@@ -287,33 +303,50 @@ quota_write() {
     return 0
 }
 
-quota_write_if_changed() {
-    local target="$1"
+# 写入 /etc 持久化文件（独立脏标记和哈希）
+quota_persist() {
     local content
     local new_hash
     
-    quota_should_write || return 0
+    quota_should_write_persist || return 0
     
     content=$(quota_serialize)
     
-    # 哈希比对（使用 printf 避免 echo 问题）
     if command -v md5sum >/dev/null 2>&1; then
         new_hash=$(printf '%s' "$content" | md5sum | cut -d' ' -f1)
-        [ "$new_hash" = "$QUOTA_LAST_HASH" ] && return 0
+        if [ "$new_hash" = "$QUOTA_LAST_HASH_PERSIST" ]; then
+            QUOTA_DIRTY_PERSIST=0
+            return 0
+        fi
     fi
     
-    quota_write "$content" "$target" || return 1
-    QUOTA_LAST_HASH="$new_hash"
-    QUOTA_DIRTY=0
+    quota_write "$content" "$QUOTA_PERSIST_FILE" || return 1
+    QUOTA_LAST_HASH_PERSIST="$new_hash"
+    QUOTA_DIRTY_PERSIST=0
     return 0
 }
 
-quota_persist() {
-    quota_write_if_changed "$QUOTA_PERSIST_FILE"
-}
-
+# 写入 /tmp 临时文件（独立脏标记和哈希）
 quota_flush() {
-    quota_write_if_changed "$QUOTA_TMP_FILE"
+    local content
+    local new_hash
+    
+    quota_should_write_tmp || return 0
+    
+    content=$(quota_serialize)
+    
+    if command -v md5sum >/dev/null 2>&1; then
+        new_hash=$(printf '%s' "$content" | md5sum | cut -d' ' -f1)
+        if [ "$new_hash" = "$QUOTA_LAST_HASH_TMP" ]; then
+            QUOTA_DIRTY_TMP=0
+            return 0
+        fi
+    fi
+    
+    quota_write "$content" "$QUOTA_TMP_FILE" || return 1
+    QUOTA_LAST_HASH_TMP="$new_hash"
+    QUOTA_DIRTY_TMP=0
+    return 0
 }
 
 # ============================================================================
