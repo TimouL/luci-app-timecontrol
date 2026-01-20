@@ -20,7 +20,7 @@ function checkTimeControlProcess() {
         
         for (var i = 0; i < lines.length; i++) {
             var line = lines[i];
-            if (line.includes('timecontrolctrl')) {
+            if (line.indexOf('timecontrolctrl') >= 0) {
                 running = true;
                 // 提取PID
                 var match = line.match(/^\s*(\d+)/);
@@ -94,7 +94,7 @@ function updateQuotaStatus() {
             
             // 更新各设备剩余时长（用分钟显示）
             var devices = data.devices || {};
-            document.querySelectorAll('.quota-remaining').forEach(function(el) {
+            Array.prototype.forEach.call(document.querySelectorAll('.quota-remaining'), function(el) {
                 var uid = el.dataset.uid;
                 if (uid && devices[uid]) {
                     var d = devices[uid];
@@ -193,13 +193,13 @@ return view.extend({
                 tableSel + ' tr td:nth-child(3) { width: 22%; }',
 
                 '#cbi-timecontrol-device tr.cbi-section-table-titles th:nth-child(4), ' +
-                tableSel + ' tr td:nth-child(4) { width: 80px; }',
+                tableSel + ' tr td:nth-child(4) { width: 70px; }',
 
                 '#cbi-timecontrol-device tr.cbi-section-table-titles th:nth-child(5), ' +
-                tableSel + ' tr td:nth-child(5) { width: 80px; }',
+                tableSel + ' tr td:nth-child(5) { width: 70px; }',
 
                 '#cbi-timecontrol-device tr.cbi-section-table-titles th:nth-child(6), ' +
-                tableSel + ' tr td:nth-child(6) { width: 100px; }',
+                tableSel + ' tr td:nth-child(6) { width: 200px; }',
 
                 '#cbi-timecontrol-device tr.cbi-section-table-titles th:nth-child(7), ' +
                 tableSel + ' tr td:nth-child(7) { width: 70px; text-align: center; }',
@@ -322,7 +322,7 @@ return view.extend({
             if (!value) return _('IP/MAC Address is required');
             
             // 检查是否为 range/CIDR/多值，提示配额不可用
-            if (value.includes('/') || value.includes('-') || value.includes(',') || value.includes(' ')) {
+            if (value.indexOf('/') >= 0 || value.indexOf('-') >= 0 || value.indexOf(',') >= 0 || value.indexOf(' ') >= 0) {
                 ui.addNotification(null, E('p', _('Note: Quota is not available for CIDR/range/multi-value addresses.')), 'info');
             }
             return true;
@@ -367,24 +367,180 @@ return view.extend({
         o.rmempty = false;
 
         o = s.option(form.ListValue, 'week', _('Week'));
-        o.width = '80px';
-        o.value('0', _('Everyday'));
-        o.value('1', _('Monday'));
-        o.value('2', _('Tuesday'));
-        o.value('3', _('Wednesday'));
-        o.value('4', _('Thursday'));
-        o.value('5', _('Friday'));
-        o.value('6', _('Saturday'));
-        o.value('7', _('Sunday'));
-        o.value('1,2,3,4,5', _('Workday'));
-        o.value('6,7', _('Rest Day'));
-        o.default = '0';
+        o.width = '200px';
         o.rmempty = false;
+
+        // cfgvalue: handle '0', empty, undefined → expand to all days
+        o.cfgvalue = function(section_id) {
+            var v = uci.get('timecontrol', section_id, 'week');
+            if (!v || v === '0') return '1,2,3,4,5,6,7';
+            return v;
+        };
+
+        // formvalue: read from hidden input
+        o.formvalue = function(section_id) {
+            var node = document.getElementById(this.cbid(section_id));
+            return node ? node.value : '';
+        };
+
+        // write: sort and normalize to '0' if all days selected
+        o.write = function(section_id, value) {
+            var arr = (value || '').split(',').filter(Boolean).sort(function(a, b) {
+                return parseInt(a) - parseInt(b);
+            });
+            if (arr.join(',') === '1,2,3,4,5,6,7') {
+                value = '0';
+            } else {
+                value = arr.join(',');
+            }
+            uci.set('timecontrol', section_id, 'week', value);
+        };
+
+        // validate: at least one day must be selected
+        o.validate = function(section_id, value) {
+            if (!value || value.split(',').filter(Boolean).length === 0) {
+                return _('Please select at least one day');
+            }
+            return true;
+        };
+
+        // Custom renderWidget: buttons + checkboxes
+        o.renderWidget = function(section_id, option_index, cfgvalue) {
+            var self = this;
+            var dayLabels = ['一', '二', '三', '四', '五', '六', '日'];
+            var selectedDays = (cfgvalue || '1,2,3,4,5,6,7').split(',').filter(Boolean);
+
+            // Hidden input for actual value storage
+            var hidden = E('input', {
+                'type': 'hidden',
+                'id': this.cbid(section_id),
+                'name': this.cbid(section_id),
+                'value': selectedDays.join(',')
+            });
+
+            // Checkbox container
+            var checkboxes = E('div', { 'style': 'display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px;' });
+
+            // Create 7 checkboxes
+            for (var i = 1; i <= 7; i++) {
+                (function(dayNum) {
+                    var cb = E('input', {
+                        'type': 'checkbox',
+                        'value': String(dayNum),
+                        'checked': selectedDays.indexOf(String(dayNum)) >= 0
+                    });
+
+                    var label = E('label', { 'style': 'display: inline-flex; align-items: center; margin-right: 2px;' }, [
+                        cb,
+                        E('span', { 'style': 'margin-left: 2px;' }, dayLabels[dayNum - 1])
+                    ]);
+
+                    checkboxes.appendChild(label);
+                })(i);
+            }
+
+            // Helper function to update hidden value
+            function updateHiddenValue() {
+                var selected = [];
+                Array.prototype.forEach.call(checkboxes.querySelectorAll('input[type="checkbox"]:checked'), function(cb) {
+                    selected.push(cb.value);
+                });
+                hidden.value = selected.join(',');
+                hidden.dispatchEvent(new Event('widget-change', { bubbles: true }));
+            }
+
+            // Bind checkbox change events
+            Array.prototype.forEach.call(checkboxes.querySelectorAll('input[type="checkbox"]'), function(cb) {
+                cb.addEventListener('change', updateHiddenValue);
+            });
+
+            // Helper function to set checkbox states
+            function setDays(days) {
+                Array.prototype.forEach.call(checkboxes.querySelectorAll('input[type="checkbox"]'), function(cb) {
+                    cb.checked = days.indexOf(parseInt(cb.value)) >= 0;
+                });
+                updateHiddenValue();
+            }
+
+            // Helper function to get currently selected days
+            function getSelectedDays() {
+                var days = [];
+                Array.prototype.forEach.call(checkboxes.querySelectorAll('input[type="checkbox"]:checked'), function(cb) {
+                    days.push(parseInt(cb.value));
+                });
+                return days;
+            }
+
+            // Helper to check if arrays are equal
+            function arraysEqual(a, b) {
+                if (a.length !== b.length) return false;
+                for (var i = 0; i < a.length; i++) {
+                    if (a[i] !== b[i]) return false;
+                }
+                return true;
+            }
+
+            // Button container
+            var buttons = E('div', { 'style': 'display: flex; gap: 4px; margin-bottom: 4px;' });
+
+            // Everyday button
+            var btnEveryday = E('button', {
+                'type': 'button',
+                'class': 'cbi-button cbi-button-action',
+                'style': 'padding: 2px 6px; font-size: 12px;'
+            }, _('Everyday'));
+            btnEveryday.addEventListener('click', function(e) {
+                e.preventDefault();
+                var current = getSelectedDays().sort(function(a, b) { return a - b; });
+                if (arraysEqual(current, [1, 2, 3, 4, 5, 6, 7])) {
+                    setDays([]);
+                } else {
+                    setDays([1, 2, 3, 4, 5, 6, 7]);
+                }
+            });
+            buttons.appendChild(btnEveryday);
+
+            // Workday button
+            var btnWorkday = E('button', {
+                'type': 'button',
+                'class': 'cbi-button cbi-button-action',
+                'style': 'padding: 2px 6px; font-size: 12px;'
+            }, _('Workday'));
+            btnWorkday.addEventListener('click', function(e) {
+                e.preventDefault();
+                var current = getSelectedDays().sort(function(a, b) { return a - b; });
+                if (arraysEqual(current, [1, 2, 3, 4, 5])) {
+                    setDays([]);
+                } else {
+                    setDays([1, 2, 3, 4, 5]);
+                }
+            });
+            buttons.appendChild(btnWorkday);
+
+            // Rest Day button
+            var btnRestday = E('button', {
+                'type': 'button',
+                'class': 'cbi-button cbi-button-action',
+                'style': 'padding: 2px 6px; font-size: 12px;'
+            }, _('Rest Day'));
+            btnRestday.addEventListener('click', function(e) {
+                e.preventDefault();
+                var current = getSelectedDays().sort(function(a, b) { return a - b; });
+                if (arraysEqual(current, [6, 7])) {
+                    setDays([]);
+                } else {
+                    setDays([6, 7]);
+                }
+            });
+            buttons.appendChild(btnRestday);
+
+            return E('div', {}, [hidden, buttons, checkboxes]);
+        };
 
         // 判断是否为单一 IP/MAC（可用配额功能）
         function isQuotaEligible(section_id) {
             var mac = uci.get('timecontrol', section_id, 'mac') || '';
-            return !mac.includes('/') && !mac.includes('-') && !mac.includes(',') && !mac.includes(' ');
+            return mac.indexOf('/') < 0 && mac.indexOf('-') < 0 && mac.indexOf(',') < 0 && mac.indexOf(' ') < 0;
         }
 
         // 启用时长限制（在 week 之后）
@@ -469,7 +625,7 @@ return view.extend({
             var sections = uci.sections('timecontrol', 'device');
             sections.forEach(function(s) {
                 if (!s.uid) {
-                    var uid = 'dev_' + Math.random().toString(36).substr(2, 8);
+                    var uid = 'dev_' + Math.random().toString(36).substring(2, 10);
                     uci.set('timecontrol', s['.name'], 'uid', uid);
                 }
             });
