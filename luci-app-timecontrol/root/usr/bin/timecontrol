@@ -799,9 +799,9 @@ case "$crrun" in
         echo -e "============ END ===========" >> /var/log/timecontrol.log
         ;;
     "add")
-        info "添加设备控制"
+        [ "$FORCE" = "1" ] && info "添加设备控制 (强制模式)" || info "添加设备控制"
         for list in $(echo "$crid" | sed -e 's/!//g' | sed 's/,/ /g'); do
-            if check_list "$list"; then
+            if [ "$FORCE" = "1" ] || check_list "$list"; then
                 timeadd "$list"
                 if ! grep -q "!$list!" "$IDLIST"; then
                     echo "!$list!" >> "$IDLIST"

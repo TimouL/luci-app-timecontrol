@@ -93,7 +93,7 @@ update_device_status() {
     local action=$2
 
     if [ "$action" = "add" ]; then
-        timecontrol add $id
+        FORCE=1 timecontrol add $id
         echo "!${id}!" >> $IDLIST
     elif [ "$action" = "del" ]; then
         timecontrol del $id
