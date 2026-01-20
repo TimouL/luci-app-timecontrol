@@ -175,3 +175,33 @@ msgstr "注意：CIDR/范围/多值地址不支持配额功能。"
 
 msgid "N/A"
 msgstr "不适用"
+
+msgid "Weekend"
+msgstr "周末"
+
+msgid "Mon"
+msgstr "一"
+
+msgid "Tue"
+msgstr "二"
+
+msgid "Wed"
+msgstr "三"
+
+msgid "Thu"
+msgstr "四"
+
+msgid "Fri"
+msgstr "五"
+
+msgid "Sat"
+msgstr "六"
+
+msgid "Sun"
+msgstr "日"
+
+msgid "Confirm"
+msgstr "确认"
+
+msgid "Close"
+msgstr "关闭"

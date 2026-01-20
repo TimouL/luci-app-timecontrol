@@ -78,46 +78,57 @@ function getHostList() {
         });
 }
 
+// 获取配额状态 JSON
+function fetchQuotaStatus() {
+    return fs.exec('/usr/bin/timecontrol-quota', ['status-json']).then(function(res) {
+        if (res.code === 0) {
+            try {
+                return JSON.parse(res.stdout);
+            } catch(e) {
+                return null;
+            }
+        }
+        return null;
+    }).catch(function() {
+        return null;
+    });
+}
+
+// 应用配额状态到 DOM
+function applyQuotaStatus(data) {
+    if (!data) return;
+
+    // 更新下次重置时间
+    var nextResetEl = document.getElementById('next_reset_time');
+    if (nextResetEl && data.next_reset) {
+        nextResetEl.textContent = data.next_reset;
+    }
+
+    // 更新各设备剩余时长（用分钟显示）
+    var devices = data.devices || {};
+    Array.prototype.forEach.call(document.querySelectorAll('.quota-remaining'), function(el) {
+        var uid = el.dataset.uid;
+        if (uid && devices[uid]) {
+            var d = devices[uid];
+            var text = String(d.remaining_minutes);
+            var color = 'inherit';
+
+            if (d.exhausted) {
+                text = '0';
+                color = 'red';
+            } else if (d.remaining_minutes <= 5) {
+                color = 'orange';
+            }
+
+            el.textContent = text;
+            el.style.color = color;
+        }
+    });
+}
+
 // 配额状态轮询更新函数
 function updateQuotaStatus() {
-    return fs.exec('/usr/bin/timecontrol-quota', ['status-json']).then(function(res) {
-        if (res.code !== 0) return;
-        
-        try {
-            var data = JSON.parse(res.stdout);
-            
-            // 更新下次重置时间
-            var nextResetEl = document.getElementById('next_reset_time');
-            if (nextResetEl && data.next_reset) {
-                nextResetEl.textContent = data.next_reset;
-            }
-            
-            // 更新各设备剩余时长（用分钟显示）
-            var devices = data.devices || {};
-            Array.prototype.forEach.call(document.querySelectorAll('.quota-remaining'), function(el) {
-                var uid = el.dataset.uid;
-                if (uid && devices[uid]) {
-                    var d = devices[uid];
-                    var text = String(d.remaining_minutes);
-                    var color = 'inherit';
-                    
-                    if (d.exhausted) {
-                        text = '0';
-                        color = 'red';
-                    } else if (d.remaining_minutes <= 5) {
-                        color = 'orange';
-                    }
-                    
-                    el.textContent = text;
-                    el.style.color = color;
-                }
-            });
-        } catch (e) {
-            console.error('Failed to parse quota status:', e);
-        }
-    }).catch(function(e) {
-        console.error('Failed to get quota status:', e);
-    });
+    return fetchQuotaStatus().then(applyQuotaStatus);
 }
 
 var cbiRichListValue = form.ListValue.extend({
@@ -156,13 +167,15 @@ return view.extend({
     load: function() {
         return Promise.all([
             uci.load('timecontrol'),
-            network.getDevices()
+            network.getDevices(),
+            fetchQuotaStatus()  // 预加载配额状态
         ]);
     },
 
     render: function(data) {
         var m, s, o;
         var hostList = [];
+        var initialQuotaData = data[2];  // 预加载的配额数据
 
         // 注入列宽样式
         // 列顺序: 1-Comment, 2-Enabled, 3-IP/MAC, 4-Start, 5-Stop, 6-Week, 7-Enable Quota, 8-Quota, 9-Remaining, 10-Actions
@@ -187,7 +200,7 @@ return view.extend({
                 tableSel + ' tr td:nth-child(1) { width: 18%; }',
 
                 '#cbi-timecontrol-device tr.cbi-section-table-titles th:nth-child(2), ' +
-                tableSel + ' tr td:nth-child(2) { width: 50px; text-align: center; }',
+                tableSel + ' tr td:nth-child(2) { width: 20px; text-align: center; }',
 
                 '#cbi-timecontrol-device tr.cbi-section-table-titles th:nth-child(3), ' +
                 tableSel + ' tr td:nth-child(3) { width: 22%; }',
@@ -199,7 +212,7 @@ return view.extend({
                 tableSel + ' tr td:nth-child(5) { width: 70px; }',
 
                 '#cbi-timecontrol-device tr.cbi-section-table-titles th:nth-child(6), ' +
-                tableSel + ' tr td:nth-child(6) { width: 200px; }',
+                tableSel + ' tr td:nth-child(6) { width: 150px; }',
 
                 '#cbi-timecontrol-device tr.cbi-section-table-titles th:nth-child(7), ' +
                 tableSel + ' tr td:nth-child(7) { width: 70px; text-align: center; }',
@@ -211,7 +224,28 @@ return view.extend({
                 tableSel + ' tr td:nth-child(9) { width: 80px; }',
 
                 '#cbi-timecontrol-device tr.cbi-section-table-titles th:nth-child(10), ' +
-                tableSel + ' tr td:nth-child(10) { width: 100px; }'
+                tableSel + ' tr td:nth-child(10) { width: 100px; }',
+
+                // Week Popover styles
+                '.week-summary-btn { display: inline-block; min-width: 44px; min-height: 32px; padding: 4px 8px; cursor: pointer; border: 1px solid #ccc; border-radius: 4px; background: #f8f8f8; text-align: center; white-space: nowrap; }',
+                '.week-summary-btn:hover { background: #e8e8e8; }',
+                '.week-popover-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.3); z-index: 9998; }',
+                '.week-popover { position: absolute; z-index: 9999; background: #fff; border: 1px solid #ccc; border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); padding: 12px; min-width: 200px; }',
+                '.week-popover-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-weight: bold; }',
+                '.week-popover-close { cursor: pointer; padding: 4px 8px; font-size: 18px; line-height: 1; border: none; background: none; }',
+                '.week-popover-buttons { display: flex; gap: 4px; margin-bottom: 8px; }',
+                '.week-popover-buttons button { padding: 4px 8px; font-size: 12px; }',
+                '.week-popover-checkboxes { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }',
+                '.week-popover-checkboxes label { display: inline-flex; align-items: center; min-width: 44px; min-height: 32px; cursor: pointer; }',
+                '.week-popover-confirm { text-align: right; }',
+                '.week-popover-confirm button { padding: 6px 16px; }',
+
+                // Mobile responsive - hide Comment column on narrow screens
+                '@media (max-width: 768px) { ' +
+                    '#cbi-timecontrol-device tr.cbi-section-table-titles th:nth-child(1), ' +
+                    tableSel + ' tr td:nth-child(1) { display: none; } ' +
+                    '.week-popover { position: fixed !important; top: 50% !important; left: 50% !important; transform: translate(-50%, -50%) !important; max-width: 90vw; } ' +
+                '}'
             ].join('\n');
             document.head.appendChild(style);
         }
@@ -366,8 +400,40 @@ return view.extend({
         o.default = '00:00';
         o.rmempty = false;
 
+        // Week summary helper function
+        function getWeekSummary(value) {
+            // Input validation: handle null/undefined/non-string
+            if (value == null || typeof value !== 'string') {
+                value = '';
+            }
+
+            var arr = value.split(',').filter(Boolean).map(function(x) {
+                var num = parseInt(x, 10);  // Explicit radix 10 to avoid octal
+                return isNaN(num) ? 0 : num;
+            }).filter(function(n) {
+                return n >= 1 && n <= 7;  // Only valid days 1-7
+            }).sort(function(a, b) { return a - b; });
+
+            // Deduplicate
+            var seen = {};
+            arr = arr.filter(function(n) {
+                if (seen[n]) return false;
+                seen[n] = true;
+                return true;
+            });
+
+            var str = arr.join(',');
+
+            // Preset pattern matching - use translated labels
+            if (str === '1,2,3,4,5,6,7' || str === '') return _('Everyday');
+            if (str === '1,2,3,4,5') return _('Workday');
+            if (str === '6,7') return _('Weekend');
+
+            // Multiple days or single day - use pure numbers for compact display
+            return arr.join('/');
+        }
+
         o = s.option(form.ListValue, 'week', _('Week'));
-        o.width = '200px';
         o.rmempty = false;
 
         // cfgvalue: handle '0', empty, undefined → expand to all days
@@ -404,10 +470,14 @@ return view.extend({
             return true;
         };
 
-        // Custom renderWidget: buttons + checkboxes
+        // Custom renderWidget: Summary button + Popover
         o.renderWidget = function(section_id, option_index, cfgvalue) {
+            // Guard against invalid section_id
+            if (!section_id) {
+                return document.createDocumentFragment();
+            }
+
             var self = this;
-            var dayLabels = ['一', '二', '三', '四', '五', '六', '日'];
             var selectedDays = (cfgvalue || '1,2,3,4,5,6,7').split(',').filter(Boolean);
 
             // Hidden input for actual value storage
@@ -418,10 +488,66 @@ return view.extend({
                 'value': selectedDays.join(',')
             });
 
-            // Checkbox container
-            var checkboxes = E('div', { 'style': 'display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px;' });
+            // Summary button
+            var summaryBtn = E('span', {
+                'class': 'week-summary-btn',
+                'role': 'button',
+                'tabindex': '0',
+                'aria-haspopup': 'dialog',
+                'aria-expanded': 'false'
+            }, getWeekSummary(selectedDays.join(',')));
 
-            // Create 7 checkboxes
+            // Popover container (initially hidden)
+            var popoverContainer = E('div', { 'style': 'display: none;' });
+
+            // Create overlay
+            var overlay = E('div', { 'class': 'week-popover-overlay' });
+
+            // Create popover
+            var popover = E('div', {
+                'class': 'week-popover',
+                'role': 'dialog',
+                'aria-modal': 'true',
+                'aria-labelledby': 'week-popover-title-' + section_id
+            });
+
+            // Popover header
+            var header = E('div', { 'class': 'week-popover-header' }, [
+                E('span', { 'id': 'week-popover-title-' + section_id }, _('Week')),
+                E('button', {
+                    'type': 'button',
+                    'class': 'week-popover-close',
+                    'aria-label': _('Close')
+                }, '\u00d7')
+            ]);
+
+            // Quick select buttons
+            var buttonsDiv = E('div', { 'class': 'week-popover-buttons' });
+
+            var btnEveryday = E('button', {
+                'type': 'button',
+                'class': 'cbi-button cbi-button-action'
+            }, _('Everyday'));
+
+            var btnWorkday = E('button', {
+                'type': 'button',
+                'class': 'cbi-button cbi-button-action'
+            }, _('Workday'));
+
+            var btnRestday = E('button', {
+                'type': 'button',
+                'class': 'cbi-button cbi-button-action'
+            }, _('Rest Day'));
+
+            buttonsDiv.appendChild(btnEveryday);
+            buttonsDiv.appendChild(btnWorkday);
+            buttonsDiv.appendChild(btnRestday);
+
+            // Checkboxes
+            var checkboxesDiv = E('div', { 'class': 'week-popover-checkboxes' });
+            var dayLabels = [_('Monday'), _('Tuesday'), _('Wednesday'),
+                             _('Thursday'), _('Friday'), _('Saturday'), _('Sunday')];
+
             for (var i = 1; i <= 7; i++) {
                 (function(dayNum) {
                     var cb = E('input', {
@@ -430,48 +556,49 @@ return view.extend({
                         'checked': selectedDays.indexOf(String(dayNum)) >= 0
                     });
 
-                    var label = E('label', { 'style': 'display: inline-flex; align-items: center; margin-right: 2px;' }, [
+                    var label = E('label', {}, [
                         cb,
-                        E('span', { 'style': 'margin-left: 2px;' }, dayLabels[dayNum - 1])
+                        E('span', { 'style': 'margin-left: 4px;' }, dayLabels[dayNum - 1])
                     ]);
 
-                    checkboxes.appendChild(label);
+                    checkboxesDiv.appendChild(label);
                 })(i);
             }
 
-            // Helper function to update hidden value
-            function updateHiddenValue() {
-                var selected = [];
-                Array.prototype.forEach.call(checkboxes.querySelectorAll('input[type="checkbox"]:checked'), function(cb) {
-                    selected.push(cb.value);
-                });
-                hidden.value = selected.join(',');
-                hidden.dispatchEvent(new Event('widget-change', { bubbles: true }));
-            }
+            // Confirm button
+            var confirmDiv = E('div', { 'class': 'week-popover-confirm' });
+            var confirmBtn = E('button', {
+                'type': 'button',
+                'class': 'cbi-button cbi-button-positive'
+            }, _('Confirm'));
+            confirmDiv.appendChild(confirmBtn);
 
-            // Bind checkbox change events
-            Array.prototype.forEach.call(checkboxes.querySelectorAll('input[type="checkbox"]'), function(cb) {
-                cb.addEventListener('change', updateHiddenValue);
-            });
+            // Assemble popover
+            popover.appendChild(header);
+            popover.appendChild(buttonsDiv);
+            popover.appendChild(checkboxesDiv);
+            popover.appendChild(confirmDiv);
 
-            // Helper function to set checkbox states
-            function setDays(days) {
-                Array.prototype.forEach.call(checkboxes.querySelectorAll('input[type="checkbox"]'), function(cb) {
-                    cb.checked = days.indexOf(parseInt(cb.value)) >= 0;
-                });
-                updateHiddenValue();
-            }
+            popoverContainer.appendChild(overlay);
+            popoverContainer.appendChild(popover);
 
-            // Helper function to get currently selected days
+            // Helper: get selected days from checkboxes
             function getSelectedDays() {
                 var days = [];
-                Array.prototype.forEach.call(checkboxes.querySelectorAll('input[type="checkbox"]:checked'), function(cb) {
-                    days.push(parseInt(cb.value));
+                Array.prototype.forEach.call(checkboxesDiv.querySelectorAll('input[type="checkbox"]:checked'), function(cb) {
+                    days.push(parseInt(cb.value, 10));
                 });
-                return days;
+                return days.sort(function(a, b) { return a - b; });
             }
 
-            // Helper to check if arrays are equal
+            // Helper: set checkbox states
+            function setDays(days) {
+                Array.prototype.forEach.call(checkboxesDiv.querySelectorAll('input[type="checkbox"]'), function(cb) {
+                    cb.checked = days.indexOf(parseInt(cb.value, 10)) >= 0;
+                });
+            }
+
+            // Helper: check if arrays are equal
             function arraysEqual(a, b) {
                 if (a.length !== b.length) return false;
                 for (var i = 0; i < a.length; i++) {
@@ -480,61 +607,168 @@ return view.extend({
                 return true;
             }
 
-            // Button container
-            var buttons = E('div', { 'style': 'display: flex; gap: 4px; margin-bottom: 4px;' });
+            // Helper: close popover
+            function closePopover() {
+                popoverContainer.style.display = 'none';
+                summaryBtn.setAttribute('aria-expanded', 'false');
 
-            // Everyday button
-            var btnEveryday = E('button', {
-                'type': 'button',
-                'class': 'cbi-button cbi-button-action',
-                'style': 'padding: 2px 6px; font-size: 12px;'
-            }, _('Everyday'));
+                // Remove scroll listener
+                document.removeEventListener('scroll', scrollHandler, { passive: true, capture: true });
+
+                // Update hidden value and summary
+                var days = getSelectedDays();
+                hidden.value = days.join(',');
+                summaryBtn.textContent = getWeekSummary(days.join(','));
+
+                // Dispatch widget-change event
+                hidden.dispatchEvent(new Event('widget-change', { bubbles: true }));
+
+                // Return focus to summary button
+                summaryBtn.focus();
+            }
+
+            // Scroll handler (defined here for add/remove)
+            var scrollHandler = function() {
+                if (popoverContainer.style.display !== 'none') {
+                    closePopover();
+                }
+            };
+
+            // Helper: open popover
+            function openPopover() {
+                // Sync checkboxes to current hidden value before showing
+                var currentDays = hidden.value.split(',').filter(Boolean).map(function(x) {
+                    return parseInt(x, 10);
+                });
+                setDays(currentDays);
+
+                popoverContainer.style.display = '';
+                summaryBtn.setAttribute('aria-expanded', 'true');
+
+                // Add scroll listener (will be removed on close)
+                document.addEventListener('scroll', scrollHandler, { passive: true, capture: true });
+
+                // Use requestAnimationFrame to ensure layout is complete before positioning
+                window.requestAnimationFrame(function() {
+                    // Position popover (desktop: below button, mobile: centered via CSS)
+                    var rect = summaryBtn.getBoundingClientRect();
+                    var viewportWidth = window.innerWidth;
+                    var viewportHeight = window.innerHeight;
+
+                    // Reset any previous positioning
+                    popover.style.top = '';
+                    popover.style.left = '';
+                    popover.style.right = '';
+                    popover.style.bottom = '';
+                    popover.style.transform = '';
+
+                    // Only apply positioning on desktop (>768px), mobile uses CSS fixed centering
+                    if (viewportWidth > 768) {
+                        // Get actual popover dimensions after rendering
+                        var popoverRect = popover.getBoundingClientRect();
+                        var popoverHeight = popoverRect.height || 200;
+                        var popoverWidth = popoverRect.width || 260;
+
+                        // Default: below and left-aligned
+                        var top = rect.bottom + 4;
+                        var left = rect.left;
+
+                        // If overflows right, align to right edge
+                        if (left + popoverWidth > viewportWidth) {
+                            left = viewportWidth - popoverWidth - 10;
+                        }
+
+                        // If overflows bottom, show above
+                        if (top + popoverHeight > viewportHeight) {
+                            top = rect.top - popoverHeight - 4;
+                        }
+
+                        popover.style.position = 'fixed';
+                        popover.style.top = top + 'px';
+                        popover.style.left = Math.max(10, left) + 'px';
+                    }
+
+                    // Focus first checkbox
+                    var firstCheckbox = checkboxesDiv.querySelector('input[type="checkbox"]');
+                    if (firstCheckbox) {
+                        firstCheckbox.focus();
+                    }
+                });
+            }
+
+            // Event: open popover on click
+            summaryBtn.addEventListener('click', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                openPopover();
+            });
+
+            // Event: keyboard support for summary button
+            summaryBtn.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    openPopover();
+                }
+            });
+
+            // Event: close on overlay click
+            overlay.addEventListener('click', function(e) {
+                e.preventDefault();
+                closePopover();
+            });
+
+            // Event: close button
+            header.querySelector('.week-popover-close').addEventListener('click', function(e) {
+                e.preventDefault();
+                closePopover();
+            });
+
+            // Event: confirm button
+            confirmBtn.addEventListener('click', function(e) {
+                e.preventDefault();
+                closePopover();
+            });
+
+            // Event: Escape key closes popover
+            popover.addEventListener('keydown', function(e) {
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    closePopover();
+                }
+            });
+
+            // Event: quick select buttons
             btnEveryday.addEventListener('click', function(e) {
                 e.preventDefault();
-                var current = getSelectedDays().sort(function(a, b) { return a - b; });
+                var current = getSelectedDays();
                 if (arraysEqual(current, [1, 2, 3, 4, 5, 6, 7])) {
                     setDays([]);
                 } else {
                     setDays([1, 2, 3, 4, 5, 6, 7]);
                 }
             });
-            buttons.appendChild(btnEveryday);
 
-            // Workday button
-            var btnWorkday = E('button', {
-                'type': 'button',
-                'class': 'cbi-button cbi-button-action',
-                'style': 'padding: 2px 6px; font-size: 12px;'
-            }, _('Workday'));
             btnWorkday.addEventListener('click', function(e) {
                 e.preventDefault();
-                var current = getSelectedDays().sort(function(a, b) { return a - b; });
+                var current = getSelectedDays();
                 if (arraysEqual(current, [1, 2, 3, 4, 5])) {
                     setDays([]);
                 } else {
                     setDays([1, 2, 3, 4, 5]);
                 }
             });
-            buttons.appendChild(btnWorkday);
 
-            // Rest Day button
-            var btnRestday = E('button', {
-                'type': 'button',
-                'class': 'cbi-button cbi-button-action',
-                'style': 'padding: 2px 6px; font-size: 12px;'
-            }, _('Rest Day'));
             btnRestday.addEventListener('click', function(e) {
                 e.preventDefault();
-                var current = getSelectedDays().sort(function(a, b) { return a - b; });
+                var current = getSelectedDays();
                 if (arraysEqual(current, [6, 7])) {
                     setDays([]);
                 } else {
                     setDays([6, 7]);
                 }
             });
-            buttons.appendChild(btnRestday);
 
-            return E('div', {}, [hidden, buttons, checkboxes]);
+            return E('div', { 'style': 'position: relative;' }, [hidden, summaryBtn, popoverContainer]);
         };
 
         // 判断是否为单一 IP/MAC（可用配额功能）
@@ -634,8 +868,19 @@ return view.extend({
 
         // 配额状态轮询（60秒）
         poll.add(updateQuotaStatus, 60);
-        updateQuotaStatus();
 
-        return m.render();
+        // 渲染后立即应用预加载的配额数据
+        // Note: m.render().then() resolves when map is built, but DOM may not be
+        // inserted into document yet. Use requestAnimationFrame to defer until
+        // next paint cycle when DOM is queryable. Without this, applyQuotaStatus
+        // may fail to find elements, causing 60s delay until poll refresh.
+        return m.render().then(function(mapEl) {
+            if (initialQuotaData) {
+                window.requestAnimationFrame(function() {
+                    applyQuotaStatus(initialQuotaData);
+                });
+            }
+            return mapEl;
+        });
     }
 });
