@@ -205,3 +205,12 @@ msgstr "确认"
 
 msgid "Close"
 msgstr "关闭"
+
+msgid "Blocking"
+msgstr "正在阻断"
+
+msgid "Global Settings"
+msgstr "全局设置"
+
+msgid "Please select at least one day"
+msgstr "请至少选择一天"

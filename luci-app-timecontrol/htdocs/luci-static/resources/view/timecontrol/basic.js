@@ -13,16 +13,16 @@ function checkTimeControlProcess() {
         if (res.code !== 0) {
             return { running: false, pid: null };
         }
-        
+
         var lines = res.stdout.split('\n');
         var running = false;
         var pid = null;
-        
+
         for (var i = 0; i < lines.length; i++) {
             var line = lines[i];
             if (line.indexOf('timecontrolctrl') >= 0) {
                 running = true;
-                // 提取PID
+                // Extract PID
                 var match = line.match(/^\s*(\d+)/);
                 if (match) {
                     pid = match[1];
@@ -30,28 +30,144 @@ function checkTimeControlProcess() {
                 break;
             }
         }
-        
+
         return { running: running, pid: pid };
     }).catch(function() {
         return { running: false, pid: null };
     });
 }
 
-// 渲染服务状态显示
-function renderServiceStatus(isRunning, pid) {
+// Check if current time is within blocking period (for status display only)
+// Note: Uses >= for start time (inclusive), backend uses > (exclusive).
+// This may cause 1-minute display discrepancy at exact boundaries, which is acceptable.
+// Format: timestart/timeend "HH:MM", week "1,2,3" or "0" (all days)
+function isInBlockPeriod(timestart, timeend, week) {
+    var now = new Date();
+    var currentDay = now.getDay();
+    // Convert: JS Sunday=0 → System Sunday=7
+    if (currentDay === 0) currentDay = 7;
+
+    // Parse week configuration
+    var weekDays = [];
+    if (!week || week === '0') {
+        weekDays = [1, 2, 3, 4, 5, 6, 7];
+    } else {
+        weekDays = week.split(',').map(function(d) {
+            return parseInt(d, 10);
+        }).filter(function(d) {
+            return d >= 1 && d <= 7;
+        });
+    }
+
+    // Check if today is in controlled days
+    if (weekDays.indexOf(currentDay) < 0) {
+        return false;
+    }
+
+    // Parse time
+    var startParts = (timestart || '00:00').split(':');
+    var endParts = (timeend || '00:00').split(':');
+    var startMinutes = parseInt(startParts[0], 10) * 60 + parseInt(startParts[1] || 0, 10);
+    var endMinutes = parseInt(endParts[0], 10) * 60 + parseInt(endParts[1] || 0, 10);
+    var currentMinutes = now.getHours() * 60 + now.getMinutes();
+
+    // Same start/end time means no blocking
+    if (startMinutes === endMinutes) {
+        return false;
+    }
+
+    // Cross-midnight case (e.g., 21:00 - 07:00)
+    if (startMinutes > endMinutes) {
+        return currentMinutes >= startMinutes || currentMinutes < endMinutes;
+    }
+
+    // Normal case (e.g., 08:00 - 18:00)
+    return currentMinutes >= startMinutes && currentMinutes < endMinutes;
+}
+
+// Get blocked device statistics (requires quota data)
+// Returns { blocked: currently blocked count, total: unique device count }
+// Counts by unique MAC address, not by rule count.
+// Note: When quotaData is null (backend not running), blocked only includes
+// time-period blocking; quota blocking is ignored. This is acceptable degradation.
+function getBlockedDeviceStats(quotaData) {
+    var sections = uci.sections('timecontrol', 'device');
+    var deviceMap = {};  // MAC -> { blocked: boolean }
+
+    for (var i = 0; i < sections.length; i++) {
+        var dev = sections[i];
+        if (dev.enable !== '1') continue;
+
+        var mac = (dev.mac || '').toUpperCase();
+        if (!mac) continue;
+
+        // Initialize device entry if not exists
+        if (!deviceMap[mac]) {
+            deviceMap[mac] = { blocked: false };
+        }
+
+        // If already blocked by another rule, skip calculation
+        if (deviceMap[mac].blocked) continue;
+
+        // Calculate block_period
+        var blockPeriod = isInBlockPeriod(dev.timestart, dev.timeend, dev.week);
+
+        // Calculate blocked_by_quota
+        var blockedByQuota = false;
+        if (dev.quota_enabled === '1' && quotaData && quotaData.devices) {
+            var uid = dev.uid;
+            var deviceQuota = quotaData.devices[uid];
+            if (deviceQuota) {
+                // Use backend-computed exhausted flag directly
+                blockedByQuota = deviceQuota.exhausted === true;
+            }
+        }
+
+        // should_block = block_period || blocked_by_quota
+        if (blockPeriod || blockedByQuota) {
+            deviceMap[mac].blocked = true;
+        }
+    }
+
+    // Count unique devices
+    var total = 0;
+    var blocked = 0;
+    for (var mac in deviceMap) {
+        if (deviceMap.hasOwnProperty(mac)) {
+            total++;
+            if (deviceMap[mac].blocked) {
+                blocked++;
+            }
+        }
+    }
+
+    return { blocked: blocked, total: total };
+}
+
+// Render service status display
+// stats: { blocked: currently blocked count, total: unique device count }
+function renderServiceStatus(isRunning, pid, stats) {
     var statusText = isRunning ? _('RUNNING') : _('NOT RUNNING');
     var color = isRunning ? 'green' : 'red';
-    var icon = isRunning ? '✓' : '✗'; 
-    
+    var icon = isRunning ? '✓' : '✗';
+
     var statusHtml = String.format(
         '<em><span style="color:%s">%s <strong>%s %s</strong></span></em>',
         color, icon, _('TimeControl Service'), statusText
     );
-    
+
     if (isRunning && pid) {
         statusHtml += ' <small>(PID: ' + pid + ')</small>';
     }
-    
+
+    // Display blocking statistics: Blocking: X/Y
+    if (stats && typeof stats.blocked === 'number' && typeof stats.total === 'number') {
+        var blockColor = stats.blocked > 0 ? '#c00' : '#666';
+        statusHtml += ' <small style="margin-left: 1em;">| ' +
+            _('Blocking') + ': <strong style="color:' + blockColor + '">' +
+            stats.blocked + '/' + stats.total + '</strong></small>';
+    }
+
     return statusHtml;
 }
 
@@ -78,7 +194,7 @@ function getHostList() {
         });
 }
 
-// 获取配额状态 JSON
+// Fetch quota status JSON
 function fetchQuotaStatus() {
     return fs.exec('/usr/bin/timecontrol-quota', ['status-json']).then(function(res) {
         if (res.code === 0) {
@@ -94,17 +210,17 @@ function fetchQuotaStatus() {
     });
 }
 
-// 应用配额状态到 DOM
+// Apply quota status to DOM
 function applyQuotaStatus(data) {
     if (!data) return;
 
-    // 更新下次重置时间
+    // Update next reset time
     var nextResetEl = document.getElementById('next_reset_time');
     if (nextResetEl && data.next_reset) {
         nextResetEl.textContent = data.next_reset;
     }
 
-    // 更新各设备剩余时长（用分钟显示）
+    // Update remaining time for each device (displayed in minutes)
     var devices = data.devices || {};
     Array.prototype.forEach.call(document.querySelectorAll('.quota-remaining'), function(el) {
         var uid = el.dataset.uid;
@@ -126,7 +242,7 @@ function applyQuotaStatus(data) {
     });
 }
 
-// 配额状态轮询更新函数
+// Quota status polling update function
 function updateQuotaStatus() {
     return fetchQuotaStatus().then(applyQuotaStatus);
 }
@@ -168,17 +284,17 @@ return view.extend({
         return Promise.all([
             uci.load('timecontrol'),
             network.getDevices(),
-            fetchQuotaStatus()  // 预加载配额状态
+            fetchQuotaStatus()  // Preload quota status
         ]);
     },
 
     render: function(data) {
         var m, s, o;
         var hostList = [];
-        var initialQuotaData = data[2];  // 预加载的配额数据
+        var initialQuotaData = data[2];  // Preloaded quota data
 
-        // 注入列宽样式
-        // 列顺序: 1-Comment, 2-Enabled, 3-IP/MAC, 4-Start, 5-Stop, 6-Week, 7-Enable Quota, 8-Quota, 9-Remaining, 10-Actions
+        // Inject column width styles
+        // Column order: 1-Comment, 2-Enabled, 3-IP/MAC, 4-Start, 5-Stop, 6-Week, 7-Enable Quota, 8-Quota, 9-Remaining, 10-Actions
         var styleId = 'timecontrol-table-style';
         if (!document.getElementById(styleId)) {
             var style = document.createElement('style');
@@ -235,10 +351,8 @@ return view.extend({
                 '.week-popover-close { cursor: pointer; padding: 4px 8px; font-size: 18px; line-height: 1; border: none; background: none; }',
                 '.week-popover-buttons { display: flex; gap: 4px; margin-bottom: 8px; }',
                 '.week-popover-buttons button { padding: 4px 8px; font-size: 12px; }',
-                '.week-popover-checkboxes { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }',
+                '.week-popover-checkboxes { display: flex; flex-wrap: wrap; gap: 8px; }',
                 '.week-popover-checkboxes label { display: inline-flex; align-items: center; min-width: 44px; min-height: 32px; cursor: pointer; }',
-                '.week-popover-confirm { text-align: right; }',
-                '.week-popover-confirm button { padding: 6px 16px; }',
 
                 // Mobile responsive - hide Comment column on narrow screens
                 '@media (max-width: 768px) { ' +
@@ -257,41 +371,48 @@ return view.extend({
         s = m.section(form.TypedSection);
         s.anonymous = true;
         s.render = function() {
-            var statusView = E('p', { id: 'service_status' }, 
+            var statusView = E('p', { id: 'service_status' },
                 '<span class="spinning"> </span> ' + _('Checking service status...'));
-            
-            checkTimeControlProcess()
-                .then(function(res) {
-                    var status = renderServiceStatus(res.running, res.pid);
+
+            // Fetch process status and quota data simultaneously
+            Promise.all([checkTimeControlProcess(), fetchQuotaStatus()])
+                .then(function(results) {
+                    var processInfo = results[0];
+                    var quotaData = results[1];
+                    var stats = getBlockedDeviceStats(quotaData);
+                    var status = renderServiceStatus(processInfo.running, processInfo.pid, stats);
                     statusView.innerHTML = status;
                 })
                 .catch(function(err) {
-                    statusView.innerHTML = '<span style="color:orange">⚠ ' + 
+                    statusView.innerHTML = '<span style="color:orange">⚠ ' +
                         _('Status check failed') + '</span>';
                     console.error('Status check error:', err);
                 });
-            
+
             poll.add(function() {
-                return checkTimeControlProcess()
-                    .then(function(res) {
-                        var status = renderServiceStatus(res.running, res.pid);
+                return Promise.all([checkTimeControlProcess(), fetchQuotaStatus()])
+                    .then(function(results) {
+                        var processInfo = results[0];
+                        var quotaData = results[1];
+                        var stats = getBlockedDeviceStats(quotaData);
+                        var status = renderServiceStatus(processInfo.running, processInfo.pid, stats);
                         statusView.innerHTML = status;
                     })
                     .catch(function(err) {
-                        statusView.innerHTML = '<span style="color:orange">⚠ ' + 
+                        statusView.innerHTML = '<span style="color:orange">⚠ ' +
                             _('Status check failed') + '</span>';
                         console.error('Status check error:', err);
                     });
             }, 5); 
 
             poll.start();
-            return E('div', { class: 'cbi-section', id: 'status_bar' }, [ 
+            return E('div', { class: 'cbi-section', id: 'status_bar' }, [
                 statusView,
                 E('div', { 'style': 'text-align: right; font-style: italic;' }, [
                     E('span', {}, [
                         _('© github '),
-                        E('a', { 
-                            'href': 'https://github.com/sirpdboy', 
+                        E('a', {
+                            'href': 'https://github.com/sirpdboy',
                             'target': '_blank',
                             'style': 'text-decoration: none;'
                         }, 'by sirpdboy')
@@ -304,7 +425,7 @@ return view.extend({
         s.anonymous = true;
         s.addremove = false;
 
-        // 控制模式（仅黑名单模式时隐藏）
+        // Control mode (hidden when blacklist-only mode)
         // o = s.option(cbiRichListValue, 'list_type', _('Control Mode'),
         //     _('blacklist: Block the networking of the target address, whitelist: Only allow networking for the target address and block all other addresses.'));
         // o.rmempty = false;
@@ -319,7 +440,7 @@ return view.extend({
         o.default = 'forward';
         o.rmempty = false;
 
-        // 配额重置时间
+        // Quota reset hour
         o = s.option(form.ListValue, 'quota_reset_hour', _('Quota Reset Hour'),
             _('Daily quota resets at this hour (0-23). Default is midnight.'));
         for (var h = 0; h < 24; h++) {
@@ -328,7 +449,7 @@ return view.extend({
         o.default = '0';
         o.rmempty = true;
 
-        // 下次重置时间（只读显示）
+        // Next reset time (read-only display)
         o = s.option(form.DummyValue, '_next_reset', _('Next Reset Time'));
         o.rawhtml = true;
         o.cfgvalue = function(section_id) {
@@ -354,8 +475,8 @@ return view.extend({
         o.placeholder = '192.168.10.100 or 00:11:22:33:44:55';
         o.validate = function(section_id, value) {
             if (!value) return _('IP/MAC Address is required');
-            
-            // 检查是否为 range/CIDR/多值，提示配额不可用
+
+            // Check if range/CIDR/multi-value, notify quota not available
             if (value.indexOf('/') >= 0 || value.indexOf('-') >= 0 || value.indexOf(',') >= 0 || value.indexOf(' ') >= 0) {
                 ui.addNotification(null, E('p', _('Note: Quota is not available for CIDR/range/multi-value addresses.')), 'info');
             }
@@ -373,11 +494,11 @@ return view.extend({
                         displayName = host.name + ' - ';
                     }
                     displayName += host.ipv4 + ' (' + host.mac + ')';
-                    
-                    // 添加IP选项
+
+                    // Add IP option
                     o.value(host.ipv4, displayName);
-                    
-                    // 添加MAC选项
+
+                    // Add MAC option
                     var macDisplay = host.mac;
                     if (host.name) {
                         macDisplay += ' - ' + host.name;
@@ -435,18 +556,35 @@ return view.extend({
 
         o = s.option(form.ListValue, 'week', _('Week'));
         o.rmempty = false;
+        o.default = '1,2,3,4,5,6,7';  // Default value for new devices
 
-        // cfgvalue: handle '0', empty, undefined → expand to all days
+        // cfgvalue: return actual UCI value to let LuCI detect changes
+        // Note: '0' needs to be expanded to '1,2,3,4,5,6,7' for renderWidget
         o.cfgvalue = function(section_id) {
             var v = uci.get('timecontrol', section_id, 'week');
-            if (!v || v === '0') return '1,2,3,4,5,6,7';
-            return v;
+            if (v === '0') return '1,2,3,4,5,6,7';
+            return v;  // Return empty for missing values to let LuCI use default
         };
 
-        // formvalue: read from hidden input
+        // formvalue: read from hidden input, sync from checkboxes if popover is open
         o.formvalue = function(section_id) {
             var node = document.getElementById(this.cbid(section_id));
-            return node ? node.value : '';
+            if (!node) return '';
+
+            // Sync from checkboxes if popover is open
+            var parent = node.parentNode;
+            var popover = parent ? parent.querySelector('.week-popover') : null;
+            if (popover && popover.offsetParent !== null) {
+                var checkboxes = popover.querySelectorAll('.week-popover-checkboxes input[type="checkbox"]:checked');
+                var days = [];
+                for (var i = 0; i < checkboxes.length; i++) {
+                    days.push(parseInt(checkboxes[i].value, 10));
+                }
+                days.sort(function(a, b) { return a - b; });
+                node.value = days.join(',');
+            }
+
+            return node.value;
         };
 
         // write: sort and normalize to '0' if all days selected
@@ -565,19 +703,10 @@ return view.extend({
                 })(i);
             }
 
-            // Confirm button
-            var confirmDiv = E('div', { 'class': 'week-popover-confirm' });
-            var confirmBtn = E('button', {
-                'type': 'button',
-                'class': 'cbi-button cbi-button-positive'
-            }, _('Confirm'));
-            confirmDiv.appendChild(confirmBtn);
-
             // Assemble popover
             popover.appendChild(header);
             popover.appendChild(buttonsDiv);
             popover.appendChild(checkboxesDiv);
-            popover.appendChild(confirmDiv);
 
             popoverContainer.appendChild(overlay);
             popoverContainer.appendChild(popover);
@@ -723,12 +852,6 @@ return view.extend({
                 closePopover();
             });
 
-            // Event: confirm button
-            confirmBtn.addEventListener('click', function(e) {
-                e.preventDefault();
-                closePopover();
-            });
-
             // Event: Escape key closes popover
             popover.addEventListener('keydown', function(e) {
                 if (e.key === 'Escape') {
@@ -771,25 +894,25 @@ return view.extend({
             return E('div', { 'style': 'position: relative;' }, [hidden, summaryBtn, popoverContainer]);
         };
 
-        // 判断是否为单一 IP/MAC（可用配额功能）
+        // Check if single IP/MAC (quota feature available)
         function isQuotaEligible(section_id) {
             var mac = uci.get('timecontrol', section_id, 'mac') || '';
             return mac.indexOf('/') < 0 && mac.indexOf('-') < 0 && mac.indexOf(',') < 0 && mac.indexOf(' ') < 0;
         }
 
-        // 启用时长限制（在 week 之后）
+        // Enable quota limit (after week column)
         o = s.option(form.Flag, 'quota_enabled', _('Enable Quota'));
         o.width = '80px';
         o.rmempty = false;
         o.default = '0';
-        // 不使用 depends（会导致列错位），改为在 renderWidget 中处理
+        // Don't use depends (causes column misalignment), handle in renderWidget instead
         o.renderWidget = function(section_id, option_index, cfgvalue) {
             if (!isQuotaEligible(section_id)) {
                 return E('em', { 'style': 'color: #999;' }, 'N/A');
             }
             return form.Flag.prototype.renderWidget.apply(this, [section_id, option_index, cfgvalue]);
         };
-        // 不合规时强制写入 0，避免配置残留
+        // Force write 0 when ineligible to avoid config residue
         o.write = function(section_id, formvalue) {
             if (!isQuotaEligible(section_id)) {
                 uci.set('timecontrol', section_id, 'quota_enabled', '0');
@@ -798,7 +921,7 @@ return view.extend({
             return form.Flag.prototype.write.apply(this, [section_id, formvalue]);
         };
 
-        // 每日配额（分钟）
+        // Daily quota (minutes)
         o = s.option(form.Value, 'quota_minutes', _('Quota (min)'));
         o.width = '80px';
         o.datatype = 'uinteger';
@@ -842,7 +965,7 @@ return view.extend({
             return true;
         };
 
-        // 当天剩余时长（只读，分钟显示）
+        // Remaining time today (read-only, displayed in minutes)
         o = s.option(form.DummyValue, '_remaining', _('Remaining Today (min)'));
         o.width = '100px';
         o.rawhtml = true;
@@ -854,7 +977,7 @@ return view.extend({
             return '<span class="quota-remaining" data-uid="' + (uid || '') + '">--</span>';
         };
 
-        // 设备保存时自动生成 uid
+        // Auto-generate uid when saving device
         m.save = function() {
             var sections = uci.sections('timecontrol', 'device');
             sections.forEach(function(s) {
@@ -866,10 +989,10 @@ return view.extend({
             return form.Map.prototype.save.apply(this, arguments);
         };
 
-        // 配额状态轮询（60秒）
+        // Quota status polling (60 seconds)
         poll.add(updateQuotaStatus, 60);
 
-        // 渲染后立即应用预加载的配额数据
+        // Apply preloaded quota data immediately after render
         // Note: m.render().then() resolves when map is built, but DOM may not be
         // inserted into document yet. Use requestAnimationFrame to defer until
         // next paint cycle when DOM is queryable. Without this, applyQuotaStatus

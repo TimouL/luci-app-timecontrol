@@ -65,8 +65,11 @@ is_weekday_in_range() {
     local configured_weekdays=$1
     local current_weekday=$(date +%u)
 
+    # 空值或 "0" 视为全选（每天）
+    [ -z "$configured_weekdays" ] || [ "$configured_weekdays" = "0" ] && return 0
+
     for ww in $(echo $configured_weekdays | sed 's/,/ /g'); do
-        if [ "$current_weekday" = "$ww" ] || [ "$ww" = "0" ]; then
+        if [ "$current_weekday" = "$ww" ]; then
             return 0
         fi
     done
