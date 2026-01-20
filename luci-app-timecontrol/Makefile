@@ -18,7 +18,7 @@ LUCI_DESCRIPTION:=LuCI support for Easy timecontrol for nftables(Internet time c
 LUCI_DEPENDS:=+bc +nftables +bash +conntrack +flock
 LUCI_PKGARCH:=all
 
-PKG_VERSION:=4.0.1
+PKG_VERSION:=4.0.2
 PKG_RELEASE:=20260118
 PKG_MAINTAINER:=sirpdboy <herboy2008@gmail.com>
 

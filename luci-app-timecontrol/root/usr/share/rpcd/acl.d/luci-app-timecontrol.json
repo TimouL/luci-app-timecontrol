@@ -10,6 +10,7 @@
                         "timecontrol": ["*"]
             },
             "file": {
+                "/bin/cat": ["exec"],
                 "/bin/ps": ["exec"],
                 "/usr/bin/ps": ["exec"],
                 "/usr/bin/timecontrol": ["exec"],
@@ -19,7 +20,8 @@
                 "/usr/libexec/timecontrol-call": ["exec"],
                 "/tmp/timecontrol_quota.json": ["read"],
                 "/etc/timecontrol_quota.json": ["read"],
-                "/var/log/timecontrol.log": ["read"]
+                "/var/log/timecontrol.log": ["read"],
+                "/var/timecontrol.idlist": ["read"]
             }
 	},
 	"write": {

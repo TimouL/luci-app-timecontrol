@@ -37,62 +37,35 @@ function checkTimeControlProcess() {
     });
 }
 
-// Check if current time is within blocking period (for status display only)
-// Note: Uses >= for start time (inclusive), backend uses > (exclusive).
-// This may cause 1-minute display discrepancy at exact boundaries, which is acceptable.
-// Format: timestart/timeend "HH:MM", week "1,2,3" or "0" (all days)
-function isInBlockPeriod(timestart, timeend, week) {
-    var now = new Date();
-    var currentDay = now.getDay();
-    // Convert: JS Sunday=0 → System Sunday=7
-    if (currentDay === 0) currentDay = 7;
-
-    // Parse week configuration
-    var weekDays = [];
-    if (!week || week === '0') {
-        weekDays = [1, 2, 3, 4, 5, 6, 7];
-    } else {
-        weekDays = week.split(',').map(function(d) {
-            return parseInt(d, 10);
-        }).filter(function(d) {
-            return d >= 1 && d <= 7;
-        });
-    }
-
-    // Check if today is in controlled days
-    if (weekDays.indexOf(currentDay) < 0) {
-        return false;
-    }
-
-    // Parse time
-    var startParts = (timestart || '00:00').split(':');
-    var endParts = (timeend || '00:00').split(':');
-    var startMinutes = parseInt(startParts[0], 10) * 60 + parseInt(startParts[1] || 0, 10);
-    var endMinutes = parseInt(endParts[0], 10) * 60 + parseInt(endParts[1] || 0, 10);
-    var currentMinutes = now.getHours() * 60 + now.getMinutes();
-
-    // Same start/end time means no blocking
-    if (startMinutes === endMinutes) {
-        return false;
-    }
-
-    // Cross-midnight case (e.g., 21:00 - 07:00)
-    if (startMinutes > endMinutes) {
-        return currentMinutes >= startMinutes || currentMinutes < endMinutes;
-    }
-
-    // Normal case (e.g., 08:00 - 18:00)
-    return currentMinutes >= startMinutes && currentMinutes < endMinutes;
+// Fetch backend blocking status from /var/timecontrol.idlist
+// Returns Promise resolving to array of blocked rule indices (e.g., [0, 2])
+function fetchBlockedRules() {
+    return fs.exec('/bin/cat', ['/var/timecontrol.idlist']).then(function(res) {
+        if (res.code !== 0 || !res.stdout) return [];
+        // Parse format: "!0!\n!2!\n" -> [0, 2]
+        var indices = [];
+        var matches = res.stdout.match(/!(\d+)!/g);
+        if (matches) {
+            for (var i = 0; i < matches.length; i++) {
+                var num = parseInt(matches[i].replace(/!/g, ''), 10);
+                if (!isNaN(num)) {
+                    indices.push(num);
+                }
+            }
+        }
+        return indices;
+    }).catch(function() {
+        return [];
+    });
 }
 
-// Get blocked device statistics (requires quota data)
-// Returns { blocked: currently blocked count, total: unique device count }
-// Counts by unique MAC address, not by rule count.
-// Note: When quotaData is null (backend not running), blocked only includes
-// time-period blocking; quota blocking is ignored. This is acceptable degradation.
-function getBlockedDeviceStats(quotaData) {
+// Get blocked device statistics from backend state
+// Returns { blocked: currently blocked count, total: unique enabled device count }
+// Reads actual blocking state from /var/timecontrol.idlist instead of time calculation
+function getBlockedDeviceStats(blockedRules) {
     var sections = uci.sections('timecontrol', 'device');
-    var deviceMap = {};  // MAC -> { blocked: boolean }
+    var enabledMacs = {};   // All enabled device MACs
+    var blockedMacs = {};   // Actually blocked device MACs
 
     for (var i = 0; i < sections.length; i++) {
         var dev = sections[i];
@@ -101,41 +74,22 @@ function getBlockedDeviceStats(quotaData) {
         var mac = (dev.mac || '').toUpperCase();
         if (!mac) continue;
 
-        // Initialize device entry if not exists
-        if (!deviceMap[mac]) {
-            deviceMap[mac] = { blocked: false };
-        }
+        // Track all enabled devices
+        enabledMacs[mac] = true;
 
-        // If already blocked by another rule, skip calculation
-        if (deviceMap[mac].blocked) continue;
-
-        // Calculate block_period
-        var blockPeriod = isInBlockPeriod(dev.timestart, dev.timeend, dev.week);
-
-        // Calculate blocked_by_quota
-        var blockedByQuota = false;
-        if (dev.quota_enabled === '1' && quotaData && quotaData.devices) {
-            var uid = dev.uid;
-            var deviceQuota = quotaData.devices[uid];
-            if (deviceQuota) {
-                // Use backend-computed exhausted flag directly
-                blockedByQuota = deviceQuota.exhausted === true;
-            }
-        }
-
-        // should_block = block_period || blocked_by_quota
-        if (blockPeriod || blockedByQuota) {
-            deviceMap[mac].blocked = true;
+        // Check if this rule index is in blocked list
+        if (blockedRules && blockedRules.indexOf(i) >= 0) {
+            blockedMacs[mac] = true;
         }
     }
 
     // Count unique devices
     var total = 0;
     var blocked = 0;
-    for (var mac in deviceMap) {
-        if (deviceMap.hasOwnProperty(mac)) {
+    for (var mac in enabledMacs) {
+        if (enabledMacs.hasOwnProperty(mac)) {
             total++;
-            if (deviceMap[mac].blocked) {
+            if (blockedMacs[mac]) {
                 blocked++;
             }
         }
@@ -374,12 +328,12 @@ return view.extend({
             var statusView = E('p', { id: 'service_status' },
                 '<span class="spinning"> </span> ' + _('Checking service status...'));
 
-            // Fetch process status and quota data simultaneously
-            Promise.all([checkTimeControlProcess(), fetchQuotaStatus()])
+            // Fetch process status and blocked rules simultaneously
+            Promise.all([checkTimeControlProcess(), fetchBlockedRules()])
                 .then(function(results) {
                     var processInfo = results[0];
-                    var quotaData = results[1];
-                    var stats = getBlockedDeviceStats(quotaData);
+                    var blockedRules = results[1];
+                    var stats = getBlockedDeviceStats(blockedRules);
                     var status = renderServiceStatus(processInfo.running, processInfo.pid, stats);
                     statusView.innerHTML = status;
                 })
@@ -390,11 +344,11 @@ return view.extend({
                 });
 
             poll.add(function() {
-                return Promise.all([checkTimeControlProcess(), fetchQuotaStatus()])
+                return Promise.all([checkTimeControlProcess(), fetchBlockedRules()])
                     .then(function(results) {
                         var processInfo = results[0];
-                        var quotaData = results[1];
-                        var stats = getBlockedDeviceStats(quotaData);
+                        var blockedRules = results[1];
+                        var stats = getBlockedDeviceStats(blockedRules);
                         var status = renderServiceStatus(processInfo.running, processInfo.pid, stats);
                         statusView.innerHTML = status;
                     })
