@@ -8,6 +8,9 @@
 'require rpc';
 'require network';
 
+// Module-level variable to store current blocked rule indices
+var currentBlockedRules = [];
+
 function checkTimeControlProcess() {
     return fs.exec('/bin/ps', ['w']).then(function(res) {
         if (res.code !== 0) {
@@ -123,6 +126,701 @@ function renderServiceStatus(isRunning, pid, stats) {
     }
 
     return statusHtml;
+}
+
+// Build section_id to index map for status indicator lookup
+function buildSectionIndexMap() {
+    var sections = uci.sections('timecontrol', 'device');
+    var map = {};
+    for (var i = 0; i < sections.length; i++) {
+        map[sections[i]['.name']] = i;
+    }
+    return map;
+}
+
+// Update all status indicators based on blocked rules
+function updateStatusIndicators(blockedRules) {
+    var sectionMap = buildSectionIndexMap();
+    var sections = uci.sections('timecontrol', 'device');
+    document.querySelectorAll('.rule-status-indicator').forEach(function(el) {
+        var sectionId = el.dataset.sectionId;
+        if (!sectionId || !(sectionId in sectionMap)) return;
+        var idx = sectionMap[sectionId];
+        var dev = sections[idx];
+        if (!dev) return;
+        var enabled = dev.enable === '1';
+        var blocked = blockedRules.indexOf(idx) >= 0;
+        el.classList.remove('disabled', 'blocked', 'active');
+        if (!enabled) {
+            el.classList.add('disabled');
+            el.title = _('Disabled');
+            el.setAttribute('aria-label', _('Rule disabled'));
+        } else if (blocked) {
+            el.classList.add('blocked');
+            el.title = _('Blocking');
+            el.setAttribute('aria-label', _('Device is being blocked'));
+        } else {
+            el.classList.add('active');
+            el.title = _('Active');
+            el.setAttribute('aria-label', _('Rule active, device not blocked'));
+        }
+    });
+}
+
+// Week summary helper function (duplicated for card view, original in TableSection)
+function getWeekSummaryForCard(value) {
+    if (value == null || typeof value !== 'string') {
+        value = '';
+    }
+
+    var arr = value.split(',').filter(Boolean).map(function(x) {
+        var num = parseInt(x, 10);
+        return isNaN(num) ? 0 : num;
+    }).filter(function(n) {
+        return n >= 1 && n <= 7;
+    }).sort(function(a, b) { return a - b; });
+
+    var seen = {};
+    arr = arr.filter(function(n) {
+        if (seen[n]) return false;
+        seen[n] = true;
+        return true;
+    });
+
+    var str = arr.join(',');
+    if (str === '1,2,3,4,5,6,7' || str === '') return _('Everyday');
+    if (str === '1,2,3,4,5') return _('Workday');
+    if (str === '6,7') return _('Weekend');
+    return arr.join('/');
+}
+
+// Store current edit modal state
+var currentEditModal = null;
+var currentEditTriggerBtn = null;
+
+// Close edit modal
+function closeEditModal() {
+    if (!currentEditModal) return;
+
+    var modal = currentEditModal.querySelector('.tc-edit-modal');
+    if (modal) {
+        modal.classList.remove('tc-modal-open');
+    }
+
+    // Unlock body scroll
+    document.body.classList.remove('tc-modal-open');
+
+    // Remove after animation
+    setTimeout(function() {
+        if (currentEditModal && currentEditModal.parentNode) {
+            currentEditModal.parentNode.removeChild(currentEditModal);
+        }
+        currentEditModal = null;
+
+        // Return focus to trigger button
+        if (currentEditTriggerBtn) {
+            currentEditTriggerBtn.focus();
+            currentEditTriggerBtn = null;
+        }
+    }, 300);
+}
+
+// Delete rule with confirmation
+function deleteRule(sectionId) {
+    if (!confirm(_('Are you sure you want to delete this rule?'))) {
+        return;
+    }
+
+    uci.remove('timecontrol', sectionId);
+    closeEditModal();
+    refreshCardView();
+
+    // Trigger dirty state
+    var evt = new Event('widget-change', { bubbles: true });
+    document.dispatchEvent(evt);
+}
+
+// Save edit modal data
+function saveEditModal(sectionId, isNew) {
+    var modal = currentEditModal;
+    if (!modal) return false;
+
+    // Clear previous errors
+    var errorFields = modal.querySelectorAll('.tc-edit-field.tc-field-error');
+    for (var i = 0; i < errorFields.length; i++) {
+        errorFields[i].classList.remove('tc-field-error');
+        var errMsg = errorFields[i].querySelector('.tc-field-error-msg');
+        if (errMsg) errMsg.remove();
+    }
+
+    // Get form values
+    var commentInput = modal.querySelector('input[name="tc-edit-comment"]');
+    var macInput = modal.querySelector('input[name="tc-edit-mac"]');
+    var timestartInput = modal.querySelector('input[name="tc-edit-timestart"]');
+    var timeendInput = modal.querySelector('input[name="tc-edit-timeend"]');
+    var enableInput = modal.querySelector('input[name="tc-edit-enable"]');
+    var quotaEnabledInput = modal.querySelector('input[name="tc-edit-quota-enabled"]');
+    var quotaMinutesInput = modal.querySelector('input[name="tc-edit-quota-minutes"]');
+
+    var comment = commentInput ? commentInput.value.trim() : '';
+    var mac = macInput ? macInput.value.trim() : '';
+    var timestart = timestartInput ? timestartInput.value : '00:00';
+    var timeend = timeendInput ? timeendInput.value : '23:59';
+    var enable = enableInput ? (enableInput.checked ? '1' : '0') : '1';
+    var quotaEnabled = quotaEnabledInput ? (quotaEnabledInput.checked ? '1' : '0') : '0';
+    var quotaMinutes = quotaMinutesInput ? quotaMinutesInput.value : '120';
+
+    // Get week values
+    var weekCheckboxes = modal.querySelectorAll('.tc-edit-week-group input[type="checkbox"]:checked');
+    var weekDays = [];
+    for (var j = 0; j < weekCheckboxes.length; j++) {
+        weekDays.push(parseInt(weekCheckboxes[j].value, 10));
+    }
+    weekDays.sort(function(a, b) { return a - b; });
+
+    // Validation
+    var hasError = false;
+
+    function showError(input, msg) {
+        var field = input.closest('.tc-edit-field');
+        if (field) {
+            field.classList.add('tc-field-error');
+            var errEl = E('div', { 'class': 'tc-field-error-msg' }, msg);
+            field.appendChild(errEl);
+        }
+        hasError = true;
+    }
+
+    // MAC/IP validation patterns
+    var macPattern = /^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$/;
+    var ipPattern = /^(\d{1,3}\.){3}\d{1,3}$/;
+    var ipRangePattern = /^(\d{1,3}\.){3}\d{1,3}\s*-\s*(\d{1,3}\.){3}\d{1,3}$/;
+
+    // MAC/IP required and format validation
+    if (!mac) {
+        showError(macInput, _('IP/MAC Address is required'));
+    } else if (!macPattern.test(mac) && !ipPattern.test(mac) && !ipRangePattern.test(mac)) {
+        showError(macInput, _('Invalid format. Use MAC (00:11:22:33:44:55) or IP (192.168.1.100)'));
+    }
+
+    // Week at least one day
+    if (weekDays.length === 0) {
+        var weekGroup = modal.querySelector('.tc-edit-week-group');
+        if (weekGroup) {
+            var weekField = weekGroup.closest('.tc-edit-field');
+            if (weekField) {
+                weekField.classList.add('tc-field-error');
+                var errEl = E('div', { 'class': 'tc-field-error-msg' }, _('Please select at least one day'));
+                weekField.appendChild(errEl);
+            }
+        }
+        hasError = true;
+    }
+
+    // Quota validation
+    if (quotaEnabled === '1') {
+        var mins = parseInt(quotaMinutes, 10);
+        if (isNaN(mins) || mins < 1 || mins > 1440) {
+            showError(quotaMinutesInput, _('Quota must be between 1-1440 minutes'));
+        }
+    }
+
+    if (hasError) {
+        return false;
+    }
+
+    // Write to UCI
+    var weekValue = weekDays.join(',');
+    if (weekValue === '1,2,3,4,5,6,7') {
+        weekValue = '0';
+    }
+
+    // For new rules, create UCI section now
+    if (isNew) {
+        sectionId = uci.add('timecontrol', 'device');
+    }
+
+    // Try to sync to table inputs first, fallback to uci.set
+    function syncField(fieldName, value) {
+        var tableInput = document.querySelector('input[id^="cbid.timecontrol.' + sectionId + '.' + fieldName + '"]');
+        if (tableInput) {
+            if (tableInput.type === 'checkbox') {
+                tableInput.checked = (value === '1');
+            } else {
+                tableInput.value = value;
+            }
+            tableInput.dispatchEvent(new Event('change', { bubbles: true }));
+        } else {
+            uci.set('timecontrol', sectionId, fieldName, value);
+        }
+    }
+
+    syncField('comment', comment);
+    syncField('mac', mac);
+    syncField('timestart', timestart);
+    syncField('timeend', timeend);
+    syncField('enable', enable);
+    syncField('week', weekValue);
+    syncField('quota_enabled', quotaEnabled);
+    syncField('quota_minutes', quotaMinutes);
+
+    // Ensure uid exists for quota
+    var existingUid = uci.get('timecontrol', sectionId, 'uid');
+    if (!existingUid) {
+        var uid = 'dev_' + Math.random().toString(36).substring(2, 10);
+        uci.set('timecontrol', sectionId, 'uid', uid);
+    }
+
+    // Trigger dirty state
+    var evt = new Event('widget-change', { bubbles: true });
+    document.dispatchEvent(evt);
+
+    closeEditModal();
+    refreshCardView();
+
+    return true;
+}
+
+// Open edit modal
+// sectionId: null for new, string for edit
+function openEditModal(sectionId) {
+    // Prevent multiple modals from opening
+    if (currentEditModal) {
+        return;
+    }
+
+    var isNew = !sectionId;
+    var triggerBtn = document.activeElement;
+
+    // For new rules, use default values (don't create UCI section yet)
+    var comment = '';
+    var mac = '';
+    var timestart = '00:00';
+    var timeend = '23:59';
+    var enable = '1';
+    var weekValue = '1,2,3,4,5,6,7';
+    var quotaEnabled = '0';
+    var quotaMinutes = '120';
+
+    // For existing rules, get current values
+    if (!isNew) {
+        comment = uci.get('timecontrol', sectionId, 'comment') || '';
+        mac = uci.get('timecontrol', sectionId, 'mac') || '';
+        timestart = uci.get('timecontrol', sectionId, 'timestart') || '00:00';
+        timeend = uci.get('timecontrol', sectionId, 'timeend') || '23:59';
+        enable = uci.get('timecontrol', sectionId, 'enable') || '1';
+        weekValue = uci.get('timecontrol', sectionId, 'week') || '0';
+        quotaEnabled = uci.get('timecontrol', sectionId, 'quota_enabled') || '0';
+        quotaMinutes = uci.get('timecontrol', sectionId, 'quota_minutes') || '120';
+        // Expand week value
+        if (weekValue === '0') weekValue = '1,2,3,4,5,6,7';
+    }
+
+    var selectedDays = weekValue.split(',').filter(Boolean).map(function(x) {
+        return parseInt(x, 10);
+    });
+
+    // Build modal DOM
+    var overlay = E('div', { 'class': 'tc-edit-overlay' });
+    var modal = E('div', {
+        'class': 'tc-edit-modal',
+        'role': 'dialog',
+        'aria-modal': 'true',
+        'aria-labelledby': 'tc-edit-title'
+    });
+
+    // Header
+    var header = E('div', { 'class': 'tc-edit-header' }, [
+        E('h3', { 'id': 'tc-edit-title' }, isNew ? _('Add Rule') : _('Edit Rule')),
+        E('button', {
+            'type': 'button',
+            'class': 'tc-edit-close',
+            'aria-label': _('Close')
+        }, '\u00d7')
+    ]);
+
+    // Body
+    var body = E('div', { 'class': 'tc-edit-body' });
+
+    // Enable field
+    // Note: LuCI E() requires null (not false) to omit checked attribute
+    var enableField = E('div', { 'class': 'tc-edit-field' }, [
+        E('div', { 'class': 'tc-edit-toggle' }, [
+            E('input', {
+                'type': 'checkbox',
+                'name': 'tc-edit-enable',
+                'checked': enable === '1' ? '' : null
+            }),
+            E('label', {}, _('Enable Rule'))
+        ])
+    ]);
+    body.appendChild(enableField);
+
+    // Comment field
+    var commentField = E('div', { 'class': 'tc-edit-field' }, [
+        E('label', {}, _('Device Name')),
+        E('input', {
+            'type': 'text',
+            'name': 'tc-edit-comment',
+            'value': comment,
+            'placeholder': _('Description')
+        })
+    ]);
+    body.appendChild(commentField);
+
+    // MAC field
+    var macField = E('div', { 'class': 'tc-edit-field' }, [
+        E('label', {}, _('IP/MAC Address')),
+        E('input', {
+            'type': 'text',
+            'name': 'tc-edit-mac',
+            'value': mac,
+            'placeholder': '192.168.1.100 or 00:11:22:33:44:55'
+        })
+    ]);
+    body.appendChild(macField);
+
+    // Time fields
+    var timeField = E('div', { 'class': 'tc-edit-field' }, [
+        E('label', {}, _('Block Time Period')),
+        E('div', { 'style': 'display: flex; gap: 8px; align-items: center;' }, [
+            E('input', {
+                'type': 'time',
+                'name': 'tc-edit-timestart',
+                'value': timestart,
+                'style': 'flex: 1;'
+            }),
+            E('span', {}, '-'),
+            E('input', {
+                'type': 'time',
+                'name': 'tc-edit-timeend',
+                'value': timeend,
+                'style': 'flex: 1;'
+            })
+        ])
+    ]);
+    body.appendChild(timeField);
+
+    // Week field
+    var dayLabels = [_('Mon'), _('Tue'), _('Wed'), _('Thu'), _('Fri'), _('Sat'), _('Sun')];
+    var weekGroup = E('div', { 'class': 'tc-edit-week-group' });
+    for (var d = 1; d <= 7; d++) {
+        (function(dayNum) {
+            var isChecked = selectedDays.indexOf(dayNum) >= 0;
+            var cb = E('input', {
+                'type': 'checkbox',
+                'value': String(dayNum),
+                'checked': isChecked ? '' : null
+            });
+            var label = E('label', { 'class': isChecked ? 'checked' : '' }, [cb, dayLabels[dayNum - 1]]);
+            cb.addEventListener('change', function() {
+                this.closest('.tc-edit-field').classList.remove('tc-field-error');
+                var errMsg = this.closest('.tc-edit-field').querySelector('.tc-field-error-msg');
+                if (errMsg) errMsg.remove();
+                // Toggle checked class for CSS compatibility
+                if (this.checked) {
+                    this.parentElement.classList.add('checked');
+                } else {
+                    this.parentElement.classList.remove('checked');
+                }
+            });
+            weekGroup.appendChild(label);
+        })(d);
+    }
+
+    var weekShortcuts = E('div', { 'class': 'tc-edit-week-shortcuts' }, [
+        E('button', { 'type': 'button', 'data-days': '1,2,3,4,5,6,7' }, _('Everyday')),
+        E('button', { 'type': 'button', 'data-days': '1,2,3,4,5' }, _('Workday')),
+        E('button', { 'type': 'button', 'data-days': '6,7' }, _('Weekend'))
+    ]);
+
+    var weekField = E('div', { 'class': 'tc-edit-field' }, [
+        E('label', {}, _('Week Days')),
+        weekShortcuts,
+        weekGroup
+    ]);
+    body.appendChild(weekField);
+
+    // Quota field - checkbox and input on same row
+    // Note: LuCI E() requires null (not false) to omit checked attribute
+    var quotaCheckbox = E('input', {
+        'type': 'checkbox',
+        'name': 'tc-edit-quota-enabled',
+        'checked': quotaEnabled === '1' ? '' : null
+    });
+    var quotaMinutesInput = E('input', {
+        'type': 'number',
+        'name': 'tc-edit-quota-minutes',
+        'value': quotaMinutes,
+        'min': '1',
+        'max': '1440',
+        'placeholder': '120',
+        'style': 'width: 80px; min-height: 36px; margin-left: 12px;' + (quotaEnabled === '1' ? '' : ' display: none;')
+    });
+    var quotaUnit = E('span', {
+        'style': 'margin-left: 4px; color: #666;' + (quotaEnabled === '1' ? '' : ' display: none;'),
+        'class': 'tc-quota-unit'
+    }, _('min'));
+    var quotaField = E('div', { 'class': 'tc-edit-field' }, [
+        E('div', { 'class': 'tc-edit-toggle' }, [
+            quotaCheckbox,
+            E('label', {}, _('Enable Daily Quota')),
+            quotaMinutesInput,
+            quotaUnit
+        ])
+    ]);
+    body.appendChild(quotaField);
+
+    // Delete button (only for edit mode)
+    if (!isNew) {
+        var deleteBtn = E('button', {
+            'type': 'button',
+            'class': 'tc-edit-delete'
+        }, _('Delete Rule'));
+        body.appendChild(deleteBtn);
+
+        deleteBtn.addEventListener('click', function() {
+            deleteRule(sectionId);
+        });
+    }
+
+    // Footer
+    var footer = E('div', { 'class': 'tc-edit-footer' }, [
+        E('button', { 'type': 'button', 'class': 'tc-btn-cancel' }, _('Cancel')),
+        E('button', { 'type': 'button', 'class': 'tc-btn-save' }, _('Save'))
+    ]);
+
+    modal.appendChild(header);
+    modal.appendChild(body);
+    modal.appendChild(footer);
+
+    var container = E('div', {}, [overlay, modal]);
+    document.body.appendChild(container);
+    currentEditModal = container;
+    currentEditTriggerBtn = triggerBtn;
+
+    // Lock body scroll
+    document.body.classList.add('tc-modal-open');
+
+    // Trigger slide-in animation
+    requestAnimationFrame(function() {
+        modal.classList.add('tc-modal-open');
+    });
+
+    // Focus first input
+    var firstInput = body.querySelector('input[type="text"], input[type="checkbox"]');
+    if (firstInput) {
+        setTimeout(function() { firstInput.focus(); }, 100);
+    }
+
+    // Event handlers
+    header.querySelector('.tc-edit-close').addEventListener('click', function() {
+        closeEditModal();
+    });
+
+    overlay.addEventListener('click', function() {
+        closeEditModal();
+    });
+
+    footer.querySelector('.tc-btn-cancel').addEventListener('click', function() {
+        closeEditModal();
+    });
+
+    footer.querySelector('.tc-btn-save').addEventListener('click', function() {
+        saveEditModal(sectionId, isNew);
+    });
+
+    // Escape key
+    modal.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') {
+            closeEditModal();
+        }
+    });
+
+    // Week shortcuts
+    weekShortcuts.querySelectorAll('button').forEach(function(btn) {
+        btn.addEventListener('click', function(e) {
+            e.preventDefault();
+            var days = this.dataset.days.split(',').map(function(x) { return parseInt(x, 10); });
+            weekGroup.querySelectorAll('input[type="checkbox"]').forEach(function(cb) {
+                var shouldCheck = days.indexOf(parseInt(cb.value, 10)) >= 0;
+                cb.checked = shouldCheck;
+                // Update checked class for CSS compatibility
+                if (shouldCheck) {
+                    cb.parentElement.classList.add('checked');
+                } else {
+                    cb.parentElement.classList.remove('checked');
+                }
+            });
+        });
+    });
+
+    // Quota toggle
+    quotaCheckbox.addEventListener('change', function() {
+        var show = this.checked;
+        quotaMinutesInput.style.display = show ? '' : 'none';
+        quotaUnit.style.display = show ? '' : 'none';
+    });
+
+    // Clear error on input change
+    body.querySelectorAll('input').forEach(function(input) {
+        input.addEventListener('input', function() {
+            var field = this.closest('.tc-edit-field');
+            if (field) {
+                field.classList.remove('tc-field-error');
+                var errMsg = field.querySelector('.tc-field-error-msg');
+                if (errMsg) errMsg.remove();
+            }
+        });
+    });
+}
+
+// Render card view for mobile devices
+// Returns DOM element (tc-card-view container)
+function renderCardView() {
+    var sections = uci.sections('timecontrol', 'device');
+    var cardContainer = E('div', { 'class': 'tc-card-view' });
+
+    for (var idx = 0; idx < sections.length; idx++) {
+        var dev = sections[idx];
+        var sectionId = dev['.name'];
+        var enabled = dev.enable === '1';
+        var comment = dev.comment || '';
+        var mac = dev.mac || '';
+        var displayName = comment || mac || _('Unnamed');
+        var timeStart = dev.timestart || '00:00';
+        var timeEnd = dev.timeend || '23:59';
+        var weekValue = dev.week;
+        if (weekValue === '0') weekValue = '1,2,3,4,5,6,7';
+        var weekSummary = getWeekSummaryForCard(weekValue);
+
+        // Determine initial status indicator class
+        var indicatorClass = 'rule-status-indicator';
+        if (!enabled) {
+            indicatorClass += ' disabled';
+        } else if (currentBlockedRules.indexOf(idx) >= 0) {
+            indicatorClass += ' blocked';
+        } else {
+            indicatorClass += ' active';
+        }
+
+        // Create checkbox for enable/disable
+        var cardCheckbox = E('input', { 'type': 'checkbox' });
+        cardCheckbox.checked = enabled;
+
+        // Create status indicator
+        var indicator = E('span', {
+            'class': indicatorClass,
+            'data-section-id': sectionId,
+            'title': enabled ? (currentBlockedRules.indexOf(idx) >= 0 ? _('Blocking') : _('Active')) : _('Disabled')
+        });
+
+        // Create edit button
+        var editBtn = E('button', {
+            'type': 'button',
+            'class': 'tc-edit-btn',
+            'aria-label': _('Edit')
+        }, '\u270f');
+
+        // Row 1: checkbox + indicator + name + MAC (small) + edit button
+        var row1Children = [
+            cardCheckbox,
+            indicator,
+            E('span', { 'class': 'tc-card-name' }, displayName)
+        ];
+
+        // Show MAC as small text if different from displayName
+        if (mac && mac !== displayName) {
+            row1Children.push(E('span', { 'class': 'tc-card-mac', 'style': 'margin-left: 4px;' }, mac));
+        }
+
+        row1Children.push(editBtn);
+
+        var cardHeader = E('div', { 'class': 'tc-card-header' }, row1Children);
+
+        // Row 2: time range + week summary + remaining time (if quota enabled)
+        var row2Content = timeStart + ' - ' + timeEnd + ' | ' + weekSummary;
+        var row2Children = [E('span', {}, row2Content)];
+
+        if (dev.quota_enabled === '1') {
+            var uid = dev.uid || '';
+            row2Children.push(E('span', { 'style': 'margin-left: 8px;' }, [
+                _('Remaining') + ': ',
+                E('span', { 'class': 'quota-remaining', 'data-uid': uid }, '--'),
+                'min'
+            ]));
+        }
+
+        var cardInfo = E('div', { 'class': 'tc-card-info' }, row2Children);
+
+        // Card container - disabled cards show all info but grayed out
+        var cardClass = 'tc-card';
+        if (!enabled) {
+            cardClass += ' disabled';
+        }
+        var card = E('div', { 'class': cardClass, 'data-section-id': sectionId }, [
+            cardHeader,
+            cardInfo
+        ]);
+
+        // Checkbox change handler - sync with table input and UCI
+        (function(sid, cardEl, checkbox) {
+            checkbox.addEventListener('change', function() {
+                var tableInput = document.querySelector(
+                    'input[id^="cbid.timecontrol.' + sid + '.enable"]'
+                );
+                if (tableInput) {
+                    tableInput.checked = this.checked;
+                    tableInput.dispatchEvent(new Event('change', { bubbles: true }));
+                } else {
+                    uci.set('timecontrol', sid, 'enable', this.checked ? '1' : '0');
+                    document.dispatchEvent(new Event('widget-change', { bubbles: true }));
+                }
+                // Update card disabled state
+                if (this.checked) {
+                    cardEl.classList.remove('disabled');
+                } else {
+                    cardEl.classList.add('disabled');
+                }
+            });
+        })(sectionId, card, cardCheckbox);
+
+        // Edit button handler
+        (function(sid, btn) {
+            btn.addEventListener('click', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                openEditModal(sid);
+            });
+        })(sectionId, editBtn);
+
+        cardContainer.appendChild(card);
+    }
+
+    return cardContainer;
+}
+
+// Refresh card view (called after add/delete/save)
+function refreshCardView() {
+    var deviceSection = document.getElementById('cbi-timecontrol-device');
+    if (!deviceSection) return;
+
+    // Remove old card view
+    var oldCards = deviceSection.querySelector('.tc-card-view');
+    if (oldCards) oldCards.remove();
+
+    // Re-render
+    var addBtn = deviceSection.querySelector('.cbi-section-create');
+    var cardView = renderCardView();
+    if (addBtn) {
+        deviceSection.insertBefore(cardView, addBtn);
+    } else {
+        deviceSection.appendChild(cardView);
+    }
+
+    // Update status indicators and quota display
+    updateStatusIndicators(currentBlockedRules);
+    updateQuotaStatus();
 }
 
 function getHostList() {
@@ -313,9 +1011,88 @@ return view.extend({
                     '#cbi-timecontrol-device tr.cbi-section-table-titles th:nth-child(1), ' +
                     tableSel + ' tr td:nth-child(1) { display: none; } ' +
                     '.week-popover { position: fixed !important; top: 50% !important; left: 50% !important; transform: translate(-50%, -50%) !important; max-width: 90vw; } ' +
-                '}'
+                '}',
+
+                // Rule status indicator styles
+                '.rule-status-indicator { display: inline-block; width: 10px; height: 10px; min-width: 10px; min-height: 10px; border-radius: 50%; margin-left: 8px; vertical-align: middle; cursor: help; flex-shrink: 0; }',
+                '.rule-status-indicator.disabled { background: #888; border: 2px solid #555; box-sizing: border-box; }',
+                '.rule-status-indicator.blocked { background: #e53935; }',
+                '.rule-status-indicator.active { background: #4caf50; }',
+
+                // Card view styles for mobile
+                '.tc-card-view { display: none; padding: 0 12px; }',
+                '.tc-card-view .tc-card { border: 1px solid #ddd; border-radius: 6px; padding: 12px; margin-bottom: 8px; background: #fff; }',
+                '.tc-card-view .tc-card.disabled { opacity: 0.5; }',
+                '.tc-card-header { display: flex; align-items: center; }',
+                '.tc-card-header > * { margin-right: 8px; }',
+                '.tc-card-header > *:last-child { margin-right: 0; }',
+                '.tc-card-name { font-weight: bold; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
+                '.tc-card-mac { color: #666; font-size: 12px; margin-top: 4px; }',
+                '.tc-card-info { color: #666; font-size: 12px; margin-top: 4px; }',
+                '.tc-card-quota { color: #666; font-size: 12px; margin-top: 4px; }',
+
+                // Mobile responsive - show card view, hide table
+                '@media (max-width: 768px) { ' +
+                    '.tc-table-view { display: none !important; } ' +
+                    '.tc-card-view { display: block; } ' +
+                    '#cbi-timecontrol-device .cbi-section-create { width: 100%; text-align: center; } ' +
+                '}',
+
+                // Edit modal styles
+                '.tc-edit-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 10000; }',
+                '.tc-edit-modal { position: fixed; left: 50%; bottom: 0; transform: translateX(-50%) translateY(100%); width: 100%; max-width: 400px; max-height: 90vh; background: #fff; border-radius: 12px 12px 0 0; box-shadow: 0 4px 20px rgba(0,0,0,0.15); z-index: 10001; display: flex; flex-direction: column; transition: transform 0.3s ease-out; }',
+                '.tc-edit-modal.tc-modal-open { transform: translateX(-50%) translateY(0); }',
+                '.tc-edit-header { display: flex; justify-content: space-between; align-items: center; padding: 16px; border-bottom: 1px solid #eee; flex-shrink: 0; }',
+                '.tc-edit-header h3 { margin: 0; font-size: 18px; }',
+                '.tc-edit-close { width: 32px; height: 32px; border: none; background: none; font-size: 24px; cursor: pointer; display: flex; align-items: center; justify-content: center; border-radius: 50%; }',
+                '.tc-edit-close:hover { background: #f0f0f0; }',
+                '.tc-edit-body { flex: 1; overflow-y: auto; padding: 16px; max-height: calc(90vh - 140px); }',
+                '.tc-edit-field { margin-bottom: 16px; }',
+                '.tc-edit-field label { display: block; font-weight: 500; margin-bottom: 6px; font-size: 14px; }',
+                '.tc-edit-field input[type="text"], .tc-edit-field input[type="time"], .tc-edit-field input[type="number"] { width: 100%; min-height: 44px; padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 16px; box-sizing: border-box; }',
+                '.tc-edit-field input:focus { outline: none; border-color: #0077cc; box-shadow: 0 0 0 2px rgba(0,119,204,0.2); }',
+                '.tc-edit-field.tc-field-error input { border-color: #e53935; }',
+                '.tc-edit-field .tc-field-error-msg { color: #e53935; font-size: 12px; margin-top: 4px; }',
+                '.tc-edit-week-group { display: flex; flex-wrap: wrap; gap: 8px; }',
+                '.tc-edit-week-group label { display: inline-flex; align-items: center; min-width: 70px; min-height: 36px; padding: 4px 8px; border: 1px solid #ddd; border-radius: 4px; cursor: pointer; }',
+                '.tc-edit-week-group label.checked { background: #e3f2fd; border-color: #0077cc; }',
+                '.tc-edit-week-group input { margin-right: 6px; }',
+                '.tc-edit-week-shortcuts { display: flex; gap: 8px; margin-bottom: 8px; }',
+                '.tc-edit-week-shortcuts button { padding: 6px 12px; font-size: 12px; border: 1px solid #ddd; border-radius: 4px; background: #f8f8f8; cursor: pointer; }',
+                '.tc-edit-week-shortcuts button:hover { background: #e8e8e8; }',
+                '.tc-edit-footer { display: flex; gap: 12px; padding: 16px; border-top: 1px solid #eee; flex-shrink: 0; }',
+                '.tc-edit-footer button { flex: 1; min-height: 44px; border-radius: 6px; font-size: 16px; cursor: pointer; }',
+                '.tc-edit-footer .tc-btn-cancel { background: #fff; border: 1px solid #ddd; color: #333; }',
+                '.tc-edit-footer .tc-btn-cancel:hover { background: #f8f8f8; }',
+                '.tc-edit-footer .tc-btn-save { background: #0077cc; border: none; color: #fff; }',
+                '.tc-edit-footer .tc-btn-save:hover { background: #0066b3; }',
+                '.tc-edit-delete { width: 100%; padding: 12px; margin-top: 16px; border: 1px solid #e53935; border-radius: 6px; background: #fff; color: #e53935; font-size: 14px; cursor: pointer; text-align: center; }',
+                '.tc-edit-delete:hover { background: #ffebee; }',
+                '.tc-edit-btn { width: 32px; height: 32px; min-width: 32px; border: none; background: #f0f0f0; border-radius: 50%; cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-left: auto; }',
+                '.tc-edit-btn:hover { background: #e0e0e0; }',
+                '.tc-edit-toggle { display: flex; align-items: center; gap: 8px; }',
+                '.tc-edit-toggle input[type="checkbox"] { width: 20px; height: 20px; }',
+                'body.tc-modal-open { overflow: hidden; }'
             ].join('\n');
             document.head.appendChild(style);
+        }
+
+        // Inject animation keyframes separately for better browser compatibility
+        var animStyleId = 'timecontrol-animation-style';
+        if (!document.getElementById(animStyleId)) {
+            var animStyle = document.createElement('style');
+            animStyle.id = animStyleId;
+            animStyle.setAttribute('type', 'text/css');
+            animStyle.appendChild(document.createTextNode(
+                '@keyframes pulse-glow {' +
+                '  0%, 100% { box-shadow: 0 0 2px 1px rgba(229, 57, 53, 0.4); }' +
+                '  50% { box-shadow: 0 0 5px 2px rgba(229, 57, 53, 0.8); }' +
+                '}' +
+                '.rule-status-indicator.blocked {' +
+                '  animation: pulse-glow 1s ease-in-out infinite;' +
+                '}'
+            ));
+            document.head.appendChild(animStyle);
         }
 
         m = new form.Map('timecontrol', _('Internet Time Control'),
@@ -333,9 +1110,11 @@ return view.extend({
                 .then(function(results) {
                     var processInfo = results[0];
                     var blockedRules = results[1];
+                    currentBlockedRules = blockedRules;
                     var stats = getBlockedDeviceStats(blockedRules);
                     var status = renderServiceStatus(processInfo.running, processInfo.pid, stats);
                     statusView.innerHTML = status;
+                    updateStatusIndicators(blockedRules);
                 })
                 .catch(function(err) {
                     statusView.innerHTML = '<span style="color:orange">⚠ ' +
@@ -348,9 +1127,11 @@ return view.extend({
                     .then(function(results) {
                         var processInfo = results[0];
                         var blockedRules = results[1];
+                        currentBlockedRules = blockedRules;
                         var stats = getBlockedDeviceStats(blockedRules);
                         var status = renderServiceStatus(processInfo.running, processInfo.pid, stats);
                         statusView.innerHTML = status;
+                        updateStatusIndicators(blockedRules);
                     })
                     .catch(function(err) {
                         statusView.innerHTML = '<span style="color:orange">⚠ ' +
@@ -419,6 +1200,18 @@ return view.extend({
         o = s.option(form.Value, 'comment', _('Comment'));
         o.optional = true;
         o.placeholder = _('Description');
+        o.renderWidget = function(section_id, option_index, cfgvalue) {
+            var widget = form.Value.prototype.renderWidget.call(this, section_id, option_index, cfgvalue);
+            var indicator = E('span', {
+                'class': 'rule-status-indicator disabled',
+                'data-section-id': section_id,
+                'title': _('Disabled'),
+                'role': 'status',
+                'aria-live': 'polite',
+                'aria-label': _('Rule disabled')
+            });
+            return E('div', { 'style': 'display: inline-flex; align-items: center;' }, [widget, indicator]);
+        };
 
         o = s.option(form.Flag, 'enable', _('Enabled'));
         o.rmempty = false;
@@ -642,10 +1435,11 @@ return view.extend({
 
             for (var i = 1; i <= 7; i++) {
                 (function(dayNum) {
+                    var isSelected = selectedDays.indexOf(String(dayNum)) >= 0;
                     var cb = E('input', {
                         'type': 'checkbox',
                         'value': String(dayNum),
-                        'checked': selectedDays.indexOf(String(dayNum)) >= 0
+                        'checked': isSelected ? '' : null
                     });
 
                     var label = E('label', {}, [
@@ -952,11 +1746,67 @@ return view.extend({
         // next paint cycle when DOM is queryable. Without this, applyQuotaStatus
         // may fail to find elements, causing 60s delay until poll refresh.
         return m.render().then(function(mapEl) {
-            if (initialQuotaData) {
-                window.requestAnimationFrame(function() {
+            window.requestAnimationFrame(function() {
+                if (initialQuotaData) {
                     applyQuotaStatus(initialQuotaData);
-                });
-            }
+                }
+                updateStatusIndicators(currentBlockedRules);
+
+                // Inject card view for mobile
+                var deviceSection = document.getElementById('cbi-timecontrol-device');
+                if (deviceSection) {
+                    // Add tc-table-view class to table for CSS toggle
+                    var table = deviceSection.querySelector('table.cbi-section-table');
+                    if (table && !table.classList.contains('tc-table-view')) {
+                        table.classList.add('tc-table-view');
+                    }
+
+                    // Insert card view before add button
+                    var addBtn = deviceSection.querySelector('.cbi-section-create');
+                    var cardView = renderCardView();
+                    if (addBtn) {
+                        deviceSection.insertBefore(cardView, addBtn);
+                    } else {
+                        deviceSection.appendChild(cardView);
+                    }
+
+                    // Apply quota status to card view
+                    if (initialQuotaData) {
+                        applyQuotaStatus(initialQuotaData);
+                    }
+
+                    // Listen for add button click - intercept on mobile
+                    // Use capture phase (true) to run BEFORE LuCI's inline click handler
+                    var createBtn = deviceSection.querySelector('.cbi-section-create button');
+                    if (createBtn) {
+                        createBtn.addEventListener('click', function(e) {
+                            // On mobile, intercept and open modal instead
+                            if (window.innerWidth < 768) {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                e.stopImmediatePropagation();
+                                openEditModal(null);
+                                return false;
+                            }
+                            // Desktop: refresh card view after default behavior
+                            setTimeout(refreshCardView, 200);
+                        }, true);
+                    }
+
+                    // Listen for delete button clicks (event delegation)
+                    deviceSection.addEventListener('click', function(e) {
+                        if (e.target.closest('.cbi-section-remove')) {
+                            setTimeout(refreshCardView, 200);
+                        }
+                    });
+                }
+
+                // Listen for UCI save completion to refresh card view (only once)
+                if (!window._tcUciAppliedListenerAdded) {
+                    document.addEventListener('uci-applied', refreshCardView);
+                    window._tcUciAppliedListenerAdded = true;
+                }
+            });
             return mapEl;
         });
     }
