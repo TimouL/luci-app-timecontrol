@@ -11,12 +11,19 @@ on:
     branches:
       - main
       - master
+  workflow_dispatch:
+    inputs:
+      update_repo_only:
+        description: 'Only update opkg repo (skip build)'
+        type: boolean
+        default: false
 
 jobs:
   # 测试阶段
   test:
     name: Run Tests
     runs-on: ubuntu-latest
+    if: ${{ !inputs.update_repo_only }}
     steps:
       - uses: actions/checkout@v4
 
@@ -31,7 +38,7 @@ jobs:
     name: Build Package
     runs-on: ubuntu-latest
     needs: test
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') && !inputs.update_repo_only
     steps:
       - uses: actions/checkout@v4
         with:
@@ -80,7 +87,7 @@ jobs:
     name: Update opkg Repository
     runs-on: ubuntu-latest
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') && !inputs.update_repo_only
     steps:
       - name: Download ipk from release
         run: |
@@ -166,3 +173,96 @@ jobs:
           publish_branch: gh-pages
           force_orphan: true
           commit_message: "chore: update opkg repo to ${{ github.ref_name }}"
+
+  # 手动更新 opkg 源（从最新 release 下载）
+  update-opkg-repo-manual:
+    name: Update opkg Repository (Manual)
+    runs-on: ubuntu-latest
+    if: inputs.update_repo_only
+    steps:
+      - name: Download ipk from latest release
+        run: |
+          mkdir -p repo
+          cd repo
+          # Download all ipk files from latest release
+          gh release download --pattern "*.ipk" --repo "$GITHUB_REPOSITORY"
+          echo "Downloaded files:"
+          ls -la *.ipk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Packages index
+        run: |
+          cd repo
+          for ipk in *.ipk; do
+            [ -f "$ipk" ] || continue
+            mkdir -p _tmp
+            tar -xzf "$ipk" -C _tmp 2>/dev/null || tar -xf "$ipk" -C _tmp
+            tar -xzf _tmp/control.tar.gz -C _tmp 2>/dev/null || tar -xf _tmp/control.tar.* -C _tmp
+            cat _tmp/control
+            echo "Filename: $ipk"
+            echo "Size: $(stat -c%s "$ipk")"
+            echo "SHA256sum: $(sha256sum "$ipk" | cut -d' ' -f1)"
+            echo ""
+            rm -rf _tmp
+          done > Packages
+          gzip -k Packages
+          echo "Packages content:"
+          cat Packages
+
+      - name: Build usign and sign Packages
+        run: |
+          # Build usign
+          git clone https://git.openwrt.org/project/usign.git /tmp/usign
+          cd /tmp/usign && cmake . && make
+
+          # Write secret key to file
+          echo "${{ secrets.USIGN_SECRET_KEY }}" > /tmp/usign.sec
+
+          # Sign Packages file
+          cd $GITHUB_WORKSPACE/repo
+          /tmp/usign/usign -S -m Packages -s /tmp/usign.sec
+
+          # Create public key file for users
+          cat > key-build.pub << 'PUBKEY'
+          untrusted comment: TimouL OpenWrt Packages
+          RWROByDpfEOBjY0D2nN1tHVfNvmRmI6itPiVQMR+Li78P22JqT+4luBZ
+          PUBKEY
+
+          # Cleanup
+          rm -f /tmp/usign.sec
+
+      - name: Create README
+        run: |
+          cat > repo/README.md << 'EOF'
+          # luci-app-timecontrol opkg 源
+
+          ## 首次使用：添加公钥
+
+          ```bash
+          wget -O /tmp/timecontrol.pub https://timoul.github.io/luci-app-timecontrol/key-build.pub
+          opkg-key add /tmp/timecontrol.pub
+          ```
+
+          ## 添加源
+
+          ```bash
+          echo "src/gz timecontrol https://timoul.github.io/luci-app-timecontrol" >> /etc/opkg/customfeeds.conf
+          ```
+
+          ## 安装
+
+          ```bash
+          opkg update
+          opkg install luci-app-timecontrol luci-i18n-timecontrol-zh-cn
+          ```
+          EOF
+
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./repo
+          publish_branch: gh-pages
+          force_orphan: true
+          commit_message: "chore: update opkg repo (manual refresh)"
