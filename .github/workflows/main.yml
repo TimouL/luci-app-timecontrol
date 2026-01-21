@@ -94,10 +94,39 @@ jobs:
           done > Packages
           gzip -k Packages
 
+      - name: Build usign and sign Packages
+        run: |
+          # Build usign
+          git clone https://git.openwrt.org/project/usign.git /tmp/usign
+          cd /tmp/usign && cmake . && make
+
+          # Write secret key to file
+          echo "${{ secrets.USIGN_SECRET_KEY }}" > /tmp/usign.sec
+
+          # Sign Packages file
+          cd $GITHUB_WORKSPACE/repo
+          /tmp/usign/usign -S -m Packages -s /tmp/usign.sec
+
+          # Create public key file for users
+          cat > key-build.pub << 'PUBKEY'
+          untrusted comment: TimouL OpenWrt Packages
+          RWROByDpfEOBjY0D2nN1tHVfNvmRmI6itPiVQMR+Li78P22JqT+4luBZ
+          PUBKEY
+
+          # Cleanup
+          rm -f /tmp/usign.sec
+
       - name: Create README
         run: |
           cat > repo/README.md << 'EOF'
           # luci-app-timecontrol opkg 源
+
+          ## 首次使用：添加公钥
+
+          ```bash
+          wget -O /tmp/timecontrol.pub https://timoul.github.io/luci-app-timecontrol/key-build.pub
+          opkg-key add /tmp/timecontrol.pub
+          ```
 
           ## 添加源
 
