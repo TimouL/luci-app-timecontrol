@@ -6,3 +6,8 @@
 *.bak
 *.swp
 *~
+
+# Signing keys (DO NOT COMMIT)
+.keys/
+*.sec
+*.pub
