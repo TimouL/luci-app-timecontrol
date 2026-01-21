@@ -37,6 +37,22 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Update version from tag
+        run: |
+          # Extract version from tag (v4.0.3 -> 4.0.3)
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+          # Update Makefile
+          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$VERSION/" luci-app-timecontrol/Makefile
+
+          # Update PKG_RELEASE to current date
+          RELEASE_DATE=$(date +%Y%m%d)
+          sed -i "s/^PKG_RELEASE:=.*/PKG_RELEASE:=$RELEASE_DATE/" luci-app-timecontrol/Makefile
+
+          echo "Updated version to $VERSION-$RELEASE_DATE"
+          grep -E "^PKG_(VERSION|RELEASE)" luci-app-timecontrol/Makefile
+
       - name: Building packages
         uses: sbwml/openwrt-gh-action-sdk@go1.24
         env:
