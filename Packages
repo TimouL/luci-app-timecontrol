@@ -1,0 +1,33 @@
+Package: luci-app-timecontrol
+Version: 4.0.3-r20260121
+Depends: libc, bc, nftables, bash, conntrack, flock
+Source: /feed/luci-app-timecontrol
+SourceName: luci-app-timecontrol
+License: Apache-2.0
+Section: luci
+SourceDateEpoch: 1768984428
+URL: https://github.com/openwrt/luci
+Maintainer: OpenWrt LuCI community
+Architecture: all
+Installed-Size: 153600
+Description:  LuCI support for Easy timecontrol for nftables(Internet time control) with daily quota feature.
+Filename: luci-app-timecontrol_4.0.3-r20260121_all.ipk
+Size: 30877
+SHA256sum: 5bb10c7e7530d648c4c1bd0d141bf43b2f73cb633d02f57c6cc0f043058a12fe
+
+Package: luci-i18n-timecontrol-zh-cn
+Version: 26.020.48346~82e954c
+Depends: libc, luci-app-timecontrol
+Source: /feed/luci-app-timecontrol
+SourceName: luci-app-timecontrol
+License: Apache-2.0
+Section: luci
+SourceDateEpoch: 1768984428
+Maintainer: sirpdboy <herboy2008@gmail.com>
+Architecture: all
+Installed-Size: 10240
+Description:  Translation for luci-app-timecontrol - 简体中文 (Simplified Chinese)
+Filename: luci-i18n-timecontrol-zh-cn_26.020.48346.82e954c_all.ipk
+Size: 2689
+SHA256sum: e14c80a204e80fe493c28c0e560633d3a724405a25262b517352c0ca44f07786
+
